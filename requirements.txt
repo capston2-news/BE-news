@@ -1,10 +1,13 @@
-# Django==5.1.2
-# djangorestframework==3.15.2
-# pymongo==4.10.1
-# dnspython==2.7.0
-# python-dotenv==1.0.1
-# PyJWT==2.10.1
-# argon2-cffi==21.3.0
-# django-cors-headers==4.9.0
+# Django == 5.1.2
+# djangorestframework == 3.15.2
+# pymongo == 4.10.1
+# dnspython == 2.7.0
+# python-dotenv == 1.0.1
+# PyJWT == 2.10.1
+# argon2-cffi == 21.3.0
+# django-cors-headers == 4.9.0
+# feedparser == 6.0.12          # Dùng để đọc dữ liệu RSS/XML
+# requests == 2.32.3            # Dùng để tải nội dung HTML của từng bài viết
+# beautifulsoup4 == 4.12.3      # Dùng để phân tích (parse) HTML và lấy phần nội dung chính
 
 # (Mongo-native): User nằm hoàn toàn ở Mongo + JWT tự tạo (không đụng Django User)

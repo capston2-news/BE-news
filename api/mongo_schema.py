@@ -212,18 +212,22 @@ def ensure_collections_and_indexes():
     # ───────────────────────── crawl_sources ─────────────────────────
     crawl_sources_validator = {
         "bsonType":"object",
-        "required":["name_source","base_url","rss_url","is_active","created_at"],
+        "required":["name_source","rss_url","is_active","created_at", "site"],
         "properties":{
             "_id":{"bsonType":"objectId"},
             "name_source":{"bsonType":"string"},
             "base_url":{"bsonType":"string"},
             "rss_url":{"bsonType":"string"},
             "is_active":{"bsonType":"bool"},
-            "created_at":{"bsonType":["date","string"]}
+            "created_at":{"bsonType":["date","string"]},
+            "site":{"bsonType":"string"}
         }
     }
     crawl_sources = _create_or_update_collection("crawl_sources", crawl_sources_validator)
-    crawl_sources.create_index([("name_source", ASCENDING)], name="ix_crawl_sources_name_source")
+    crawl_sources.create_index(
+        [("name_source", ASCENDING)],
+        name="ux_crawl_sources_name_source",
+        unique=True)
 
     # ───────────────────────── crawl_runs ─────────────────────────
     # SQL: status crawl_status (enum)
@@ -260,10 +264,15 @@ def ensure_collections_and_indexes():
         }
     }
     raw_pages = _create_or_update_collection("raw_pages", raw_pages_validator)
+    # raw_pages.create_index(
+    #     [("source_id", ASCENDING), ("crawl_run_id", ASCENDING)],
+    #     name="ux_raw_pages_source_run",
+    #     unique=True
+    # )
     raw_pages.create_index(
-        [("source_id", ASCENDING), ("crawl_run_id", ASCENDING)],
-        name="ux_raw_pages_source_run",
-        unique=True
+    [("source_id", ASCENDING), ("url", ASCENDING)],
+    name="ux_raw_pages_source_url",
+    unique=True
     )
 
     # ───────────────────────── extracted_articles ─────────────────────────
