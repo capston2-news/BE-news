@@ -124,23 +124,29 @@ def ensure_collections_and_indexes():
     # SQL có status article_status (enum); dùng enum string trong Mongo.
     articles_validator = {
         "bsonType":"object",
-        "required":["title","content","author_id","category_id","is_deleted"],
+        "required":["title","content","category_id","is_deleted"],
         "properties":{
             "_id":{"bsonType":"objectId"},
             "title":{"bsonType":"string"},
             "content":{"bsonType":"string"},
-            "author_id":{"bsonType":"objectId"},      # -> authors._id
+            "author_id": {"bsonType": ["objectId", "null"]},      # -> authors._id
             "category_id":{"bsonType":"objectId"},    # -> categories._id
             "category_child_id":{"bsonType":["objectId","null"]},  # -> category_child._id
             "published_at":{"bsonType":["date","null","string"]},
             "status":{"enum":["draft","scheduled","published","archived", None]},  # tuỳ bạn định nghĩa
-            "is_deleted":{"bsonType":"bool"}
+            "is_deleted":{"bsonType":"bool"},
+            "created_at": {"bsonType": ["date","null","string"]},
+            "updated_at": {"bsonType": ["date","null","string"]},
+            "site": {"bsonType": ["string", "null"]},
+            "external_url":{"bsonType":["string","null"]},
+            "images":{"bsonType":"array", "items":{"bsonType":"string"}},
         }
     }
     articles = _create_or_update_collection("articles", articles_validator)
     articles.create_index([("title", ASCENDING)], name="ix_articles_title")
     articles.create_index([("author_id", ASCENDING)], name="ix_articles_author_id")
     articles.create_index([("category_id", ASCENDING)], name="ix_articles_category_id")
+    articles.create_index([("site", ASCENDING), ("external_url", ASCENDING)], name="ux_articles_site_external_url", unique=True)
 
     # ───────────────────────── article_topics (junction) ─────────────────────────
     article_topics_validator = {

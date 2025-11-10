@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterable
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs
 import re
@@ -31,116 +31,207 @@ def _gather_paragraphs(root) -> List[str]:
             texts.append(t)
     return texts
 
-# =========================
-# Ảnh: thu & lọc & ưu tiên
-# =========================
-
-def _collect_images(soup: BeautifulSoup, base_url: str) -> List[str]:
-    imgs = set()
-
-    # 1) Meta image
+def _meta_images(soup: BeautifulSoup, base_url: str) -> List[str]:
+    out = []
     for sel in [
         'meta[property="og:image"]', 'meta[name="og:image"]',
         'meta[name="twitter:image"]', 'meta[property="twitter:image"]'
     ]:
         m = soup.select_one(sel)
         if m and m.get("content"):
-            imgs.add(urljoin(base_url, m["content"].strip()))
-
-    # 2) <img> & lazy-load
-    for img in soup.find_all("img"):
-        cand = (
-            img.get("src")
-            or img.get("data-src")
-            or img.get("data-original")
-            or img.get("data-lazy")
-            or (img.get("srcset") or "").split(" ")[0]
-        )
-        if not cand:
-            continue
-        if cand.startswith("data:"):
-            continue
-        if not cand.startswith(("http", "/")):
-            continue
-        imgs.add(urljoin(base_url, cand.strip()))
-
-    # 3) <figure><img>
-    for fig in soup.find_all("figure"):
-        im = fig.find("img")
-        if im:
-            cand = im.get("src") or im.get("data-src") or im.get("data-original")
-            if cand:
-                imgs.add(urljoin(base_url, cand.strip()))
-
-    # ---- Lọc asset tĩnh/icon/logo ----
-    ALLOWED_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif")
-    HOST_BLACKLIST_SUBSTR = (
-        "static.", "cdn-cgi",
-    )
-    PATH_BLACKLIST_SUBSTR = (
-        "/static/", "/assets/", "/sprites/", "/icons/", "/favicon",
-        "/emoji/", "/emoticon/", "/svg/",
-        "/ads/", "/adserver/", "/banner/",
-        "/tracking/", "/analytics/",
-    )
-    NAME_BLACKLIST_KEYWORDS = (
-        "logo", "icon", "sprite", "placeholder", "blank", "transparent",
-        "avatar", "ava_", "profile", "userpic",
-        "thumb", "thumbnail", "small", "micro", "1x1", "pixel"
-    )
-
-    def is_good(u: str) -> bool:
-        p = urlparse(u)
-        host = (p.netloc or "").lower()
-        path = (p.path or "").lower()  # không gồm query
-
-        if not (path.endswith(ALLOWED_EXT) or "upload" in u.lower()):
-            return False
-        if any(bad in host for bad in HOST_BLACKLIST_SUBSTR):
-            return False
-        if any(bad in path for bad in PATH_BLACKLIST_SUBSTR):
-            return False
-        fname = path.rsplit("/", 1)[-1]
-        if any(kw in fname for kw in NAME_BLACKLIST_KEYWORDS):
-            return False
-        return True
-
-    out = [u for u in imgs if is_good(u)]
-
-    # ---- Chấm điểm ưu tiên ảnh nội dung ----
-    def _img_score(u: str) -> int:
-        s = 0
-        ul = u.lower()
-        p = urlparse(u)
-        host = (p.netloc or "").lower()
-        path = (p.path or "").lower()
-        q = parse_qs(p.query or "")
-
-        if "upload" in ul:
-            s += 2
-        if any(dom in host for dom in ["vnecdn.net", "vnexpress", "thanhnien"]):
-            s += 2
-        try:
-            if "w" in q and int(q["w"][0]) >= 600:
-                s += 1
-            elif "width" in q and int(q["width"][0]) >= 600:
-                s += 1
-        except Exception:
-            pass
-        filename = path.rsplit("/", 1)[-1]
-        if any(k in filename for k in ["thumb", "small", "avatar", "ava_", "icon", "logo"]):
-            s -= 2
-        return s
-
-    seen = set()
-    uniq = []
+            out.append(urljoin(base_url, m["content"].strip()))
+    # unique
+    seen, uniq = set(), []
     for u in out:
         if u not in seen:
-            seen.add(u)
-            uniq.append(u)
-    uniq.sort(key=lambda x: _img_score(x), reverse=True)
+            seen.add(u); uniq.append(u)
+    return uniq
 
-    return uniq[:10]  # tối đa 10 ảnh
+# =========================
+# Body containers (chỉ ở trong bài)
+# =========================
+
+VNE_BODY_CANDIDATES = [
+    ".fck_detail",
+    ".sidebar-1 .detail-cmain .detail-content",
+    ".sidebar-1 .detail-content",
+    ".article-detail .article-content",
+    "article .content-detail",
+]
+
+TN_BODY_CANDIDATES = [
+    ".article__main-content",
+    ".detail-content__body",
+    ".details__content .cms-body",
+    ".details__content",
+    ".article__body",
+    ".article-content",
+]
+
+GENERIC_BODY_CANDIDATES = [
+    "article .content", "article .post-content", "article .entry-content", "article"
+]
+
+EXCLUDE_WITHIN_BODY = [
+    ".related", ".article__related", ".list__related", ".box__related",
+    ".recommend", ".suggest", ".mostread", ".most-view", ".trending",
+    ".aside", ".sidebar", ".header", ".footer", ".breadcrumb",
+    ".ads", ".ad", ".adbox", ".banner", ".qc", ".quangcao",
+    ".social", ".tags", ".author", ".comment", ".newsletter",
+]
+
+# =========================
+# Ảnh: thu & lọc & ưu tiên (CHỈ trong body)
+# =========================
+
+_IMG_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")
+
+HOST_BLACKLIST_SUBSTR = ("cdn-cgi", )
+PATH_BLACKLIST_SUBSTR = (
+    "/static/", "/assets/", "/sprites/", "/icons/", "/favicon",
+    "/emoji/", "/emoticon/", "/svg/",
+    "/ads/", "/adserver/", "/banner/",
+    "/tracking/", "/analytics/",
+    "/image/ava"
+)
+NAME_BLACKLIST_KEYWORDS = (
+    "logo","icon","sprite","placeholder","blank","transparent",
+    "avatar","ava_","profile","userpic","micro","1x1","pixel"
+)
+EXACT_BLACKLIST = {
+    "https://static.thanhnien.com.vn/thanhnien.vn/image/ava_inter.png"
+}
+
+def _pick_from_srcset(srcset: str) -> Optional[str]:
+    try:
+        parts = [p.strip() for p in srcset.split(",") if p.strip()]
+        best_url, best_score = None, -1
+        for part in parts:
+            seg = part.split()
+            url = seg[0]
+            desc = seg[1] if len(seg) > 1 else ""
+            score = 0
+            if desc.endswith("w"):
+                try: score = int(desc[:-1])
+                except: score = 0
+            elif desc.endswith("x"):
+                try: score = int(float(desc[:-1]) * 1000)
+                except: score = 0
+            if score > best_score:
+                best_url, best_score = url, score
+        return best_url
+    except:
+        return None
+
+def _candidate_from_style(style_val: str) -> Optional[str]:
+    if not style_val: return None
+    m = re.search(r'background-image\s*:\s*url\(([^)]+)\)', style_val, flags=re.I)
+    if not m: return None
+    u = m.group(1).strip(' "\'')
+    return u
+
+def _get_img_candidate(tag) -> Optional[str]:
+    for attr in ("src", "data-zoom-src", "data-src", "data-original", "data-splide-lazy", "data-lazy"):
+        v = tag.get(attr)
+        if v: return v
+    for attr in ("srcset", "data-srcset"):
+        ss = tag.get(attr)
+        if ss:
+            picked = _pick_from_srcset(ss)
+            if picked: return picked
+    st = tag.get("style")
+    if st:
+        v = _candidate_from_style(st)
+        if v: return v
+    return None
+
+def _looks_like_image_url(u: str) -> bool:
+    low = u.lower()
+    if any(low.split("?")[0].endswith(ext) for ext in _IMG_EXT): return True
+    if any(k in low for k in ["format=webp","image/","img=","photo=","picture="]): return True
+    return False
+
+def _filter_good_urls(urls: Iterable[str]) -> List[str]:
+    out = []
+    for u in urls:
+        if not u or u in EXACT_BLACKLIST: continue
+        p = urlparse(u); host = (p.netloc or "").lower(); path = (p.path or "").lower()
+        if not (_looks_like_image_url(u)): continue
+        if any(bad in host for bad in HOST_BLACKLIST_SUBSTR): continue
+        if any(bad in path for bad in PATH_BLACKLIST_SUBSTR): continue
+        fname = path.rsplit("/", 1)[-1]
+        if any(kw in fname for kw in NAME_BLACKLIST_KEYWORDS): continue
+        try:
+            q = parse_qs(p.query or "")
+            if "w" in q and int(q["w"][0]) < 320: continue
+            if "width" in q and int(q["width"][0]) < 320: continue
+        except: pass
+        out.append(u)
+    return out
+
+def _score_image(u: str) -> int:
+    s = 0
+    p = urlparse(u)
+    host = (p.netloc or "").lower()
+    q = parse_qs(p.query or "")
+    if any(dom in host for dom in ["vnecdn.net", "vnexpress", "thanhnien"]): s += 2
+    try:
+        if "w" in q and int(q["w"][0]) >= 800: s += 1
+        elif "width" in q and int(q["width"][0]) >= 800: s += 1
+    except: pass
+    return s
+
+def _dedup_and_rank(urls: Iterable[str]) -> List[str]:
+    seen, uniq = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u); uniq.append(u)
+    uniq.sort(key=_score_image, reverse=True)
+    return uniq
+
+def _collect_images_strictly_inside(body_node, base_url: str) -> List[str]:
+    if not body_node:
+        return []
+
+    excluded_imgs = set()
+    for sel in EXCLUDE_WITHIN_BODY:
+        for im in body_node.select(f"{sel} img"):
+            excluded_imgs.add(im)
+
+    urls = set()
+
+    for img in body_node.find_all("img"):
+        if img in excluded_imgs: continue
+        cand = _get_img_candidate(img)
+        if not cand: continue
+        if cand.startswith("data:"): continue
+        if not cand.startswith(("http", "/")): continue
+        urls.add(urljoin(base_url, cand.strip()))
+
+    for pic in body_node.find_all("picture"):
+        for src in pic.find_all("source"):
+            cand = _get_img_candidate(src)
+            if cand and cand.startswith(("http","/")):
+                urls.add(urljoin(base_url, cand.strip()))
+
+    for fig in body_node.find_all("figure"):
+        im = fig.find("img")
+        if im and im not in excluded_imgs:
+            cand = _get_img_candidate(im)
+            if cand:
+                urls.add(urljoin(base_url, cand.strip()))
+
+    for a in body_node.find_all("a", href=True):
+        href = a["href"].strip()
+        if _looks_like_image_url(href):
+            urls.add(urljoin(base_url, href))
+
+    for node in body_node.find_all(style=True):
+        cand = _candidate_from_style(node.get("style") or "")
+        if cand and cand.startswith(("http","/")):
+            urls.add(urljoin(base_url, cand.strip()))
+
+    return _dedup_and_rank(_filter_good_urls(urls))[:20]
 
 # =========================
 # Author extraction
@@ -166,7 +257,6 @@ def _extract_author(soup: BeautifulSoup) -> Optional[str]:
             name = m["content"].strip()
             if name:
                 return name
-
     for sel in _AUTHOR_NODE_SELECTORS_COMMON:
         node = soup.select_one(sel)
         if node:
@@ -179,7 +269,6 @@ def _extract_author(soup: BeautifulSoup) -> Optional[str]:
                         if cand:
                             return cand
                 return t.strip(" .")
-
     full = soup.get_text(" ", strip=True)
     if full:
         for pat in _AUTHOR_PATTERNS:
@@ -190,109 +279,110 @@ def _extract_author(soup: BeautifulSoup) -> Optional[str]:
                     return cand
     return None
 
-def _force_eic_if_present(soup: BeautifulSoup, current_author: Optional[str]) -> Optional[str]:
-    full = soup.get_text(" ", strip=True) or ""
-    low = full.lower()
-    if "tổng biên tập" in low and "nguyễn ngọc toàn" in low:
-        return "Nguyễn Ngọc Toàn"
-    return current_author
-
 # =========================
 # Parsers theo site
 # =========================
 
+def _pick_body_node_for_vne(soup: BeautifulSoup):
+    for sel in VNE_BODY_CANDIDATES:
+        node = soup.select_one(sel)
+        if node:
+            return node
+    return None
+
+def _pick_body_node_for_tn(soup: BeautifulSoup):
+    for sel in TN_BODY_CANDIDATES:
+        node = soup.select_one(sel)
+        if node:
+            return node
+    return None
+
+def _pick_body_node_generic(soup: BeautifulSoup):
+    for sel in GENERIC_BODY_CANDIDATES:
+        node = soup.select_one(sel)
+        if node:
+            return node
+    return None
+
 def extract_article_vnexpress(html: str, base_url: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
+    title = _first_text(soup, ["h1.title-detail", "h1"]) \
+        or (soup.title.string.strip() if soup.title and soup.title.string else None)
 
-    title = _first_text(soup, ["h1.title-detail", "h1"])
-    if not title and soup.title and soup.title.string:
-        title = soup.title.string.strip()
-
+    body_node = _pick_body_node_for_vne(soup) or _pick_body_node_generic(soup)
     body = None
-    for sel in [
-        ".fck_detail",
-        ".sidebar-1 .detail-cmain .detail-content",
-        ".sidebar-1 .detail-content",
-        ".article-detail .article-content",
-        "article .content-detail",
-        "article"
-    ]:
-        node = soup.select_one(sel)
-        texts = _gather_paragraphs(node)
+    if body_node:
+        texts = _gather_paragraphs(body_node)
         if texts:
             body = "\n\n".join(texts)
-            break
     if not body:
         texts = _gather_paragraphs(soup)
         body = "\n\n".join(texts) if texts else None
 
-    images = _collect_images(soup, base_url)
-    author = _force_eic_if_present(soup, _extract_author(soup))
+    images = _collect_images_strictly_inside(body_node, base_url) if body_node else []
+    if not images:
+        images = _meta_images(soup, base_url)[:1]
+
+    author = _extract_author(soup)
 
     return {"title": title, "body": body, "images": images, "author": author}
 
 def extract_article_thanhnien(html: str, base_url: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
-
     title = _first_text(soup, [
         "h1.title-detail",
         "h1.article-title",
         "h1.details__headline",
         "h1.details__title",
         "h1"
-    ])
-    if not title and soup.title and soup.title.string:
-        title = soup.title.string.strip()
+    ]) or (soup.title.string.strip() if soup.title and soup.title.string else None)
 
+    body_node = _pick_body_node_for_tn(soup) or _pick_body_node_generic(soup)
     body = None
-    for sel in [
-        ".article__main-content",
-        ".detail-content__body",
-        ".details__content .cms-body",
-        ".details__content",
-        ".article__body",
-        ".article-content",
-        "article"
-    ]:
-        node = soup.select_one(sel)
-        texts = _gather_paragraphs(node)
+    if body_node:
+        texts = _gather_paragraphs(body_node)
         if texts:
             body = "\n\n".join(texts)
-            break
     if not body:
         texts = _gather_paragraphs(soup)
         body = "\n\n".join(texts) if texts else None
 
-    images = _collect_images(soup, base_url)
-    author = _force_eic_if_present(soup, _extract_author(soup))
+    images = _collect_images_strictly_inside(body_node, base_url) if body_node else []
+    if not images:
+        images = _meta_images(soup, base_url)[:1]
+
+    author = _extract_author(soup)
 
     return {"title": title, "body": body, "images": images, "author": author}
-
-# =========================
-# Generic fallback
-# =========================
 
 def extract_article_generic(html: str, title_selectors: List[str], body_selectors: List[str], base_url: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
 
-    title = None
-    if title_selectors:
-        title = _first_text(soup, title_selectors)
+    title = _first_text(soup, title_selectors) if title_selectors else None
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    body = None
+    body_node = None
     for sel in (body_selectors or []):
         node = soup.select_one(sel)
-        texts = _gather_paragraphs(node)
+        if node:
+            body_node = node
+            break
+    if not body_node:
+        body_node = _pick_body_node_generic(soup)
+
+    body = None
+    if body_node:
+        texts = _gather_paragraphs(body_node)
         if texts:
             body = "\n\n".join(texts)
-            break
     if not body:
         texts = _gather_paragraphs(soup)
         body = "\n\n".join(texts) if texts else None
 
-    images = _collect_images(soup, base_url)
-    author = _force_eic_if_present(soup, _extract_author(soup))
+    images = _collect_images_strictly_inside(body_node, base_url) if body_node else []
+    if not images:
+        images = _meta_images(soup, base_url)[:1]
 
+    author = _extract_author(soup)
     return {"title": title, "body": body, "images": images, "author": author}
