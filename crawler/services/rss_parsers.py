@@ -39,7 +39,11 @@ def _meta_images(soup: BeautifulSoup, base_url: str) -> List[str]:
     ]:
         m = soup.select_one(sel)
         if m and m.get("content"):
-            out.append(urljoin(base_url, m["content"].strip()))
+            val = m["content"].strip()
+            # 🚫 bỏ data: URI
+            if val.startswith("data:"):
+                continue
+            out.append(urljoin(base_url, val))
     # unique
     seen, uniq = set(), []
     for u in out:
@@ -51,6 +55,7 @@ def _meta_images(soup: BeautifulSoup, base_url: str) -> List[str]:
 # Body containers (chỉ ở trong bài)
 # =========================
 
+# VNExpress
 VNE_BODY_CANDIDATES = [
     ".fck_detail",
     ".sidebar-1 .detail-cmain .detail-content",
@@ -59,6 +64,7 @@ VNE_BODY_CANDIDATES = [
     "article .content-detail",
 ]
 
+# Thanh Niên
 TN_BODY_CANDIDATES = [
     ".article__main-content",
     ".detail-content__body",
@@ -68,10 +74,12 @@ TN_BODY_CANDIDATES = [
     ".article-content",
 ]
 
+# fallback rất nhẹ (nếu 2 bộ trên không khớp)
 GENERIC_BODY_CANDIDATES = [
     "article .content", "article .post-content", "article .entry-content", "article"
 ]
 
+# Loại các vùng không phải nội dung bài, ngay cả khi chúng nằm trong body
 EXCLUDE_WITHIN_BODY = [
     ".related", ".article__related", ".list__related", ".box__related",
     ".recommend", ".suggest", ".mostread", ".most-view", ".trending",
@@ -112,11 +120,15 @@ def _pick_from_srcset(srcset: str) -> Optional[str]:
             desc = seg[1] if len(seg) > 1 else ""
             score = 0
             if desc.endswith("w"):
-                try: score = int(desc[:-1])
-                except: score = 0
+                try:
+                    score = int(desc[:-1])
+                except:
+                    score = 0
             elif desc.endswith("x"):
-                try: score = int(float(desc[:-1]) * 1000)
-                except: score = 0
+                try:
+                    score = int(float(desc[:-1]) * 1000)
+                except:
+                    score = 0
             if score > best_score:
                 best_url, best_score = url, score
         return best_url
@@ -128,44 +140,79 @@ def _candidate_from_style(style_val: str) -> Optional[str]:
     m = re.search(r'background-image\s*:\s*url\(([^)]+)\)', style_val, flags=re.I)
     if not m: return None
     u = m.group(1).strip(' "\'')
+    # 🚫 loại data:
+    if u.startswith("data:"): return None
     return u
 
 def _get_img_candidate(tag) -> Optional[str]:
+    # thứ tự ưu tiên các attr “lazy”
     for attr in ("src", "data-zoom-src", "data-src", "data-original", "data-splide-lazy", "data-lazy"):
         v = tag.get(attr)
-        if v: return v
+        if v:
+            if v.startswith("data:"):  # 🚫
+                return None
+            return v
     for attr in ("srcset", "data-srcset"):
         ss = tag.get(attr)
         if ss:
             picked = _pick_from_srcset(ss)
-            if picked: return picked
+            if picked and not picked.startswith("data:"):  # 🚫
+                return picked
     st = tag.get("style")
     if st:
         v = _candidate_from_style(st)
-        if v: return v
+        if v:
+            return v
     return None
 
 def _looks_like_image_url(u: str) -> bool:
     low = u.lower()
-    if any(low.split("?")[0].endswith(ext) for ext in _IMG_EXT): return True
-    if any(k in low for k in ["format=webp","image/","img=","photo=","picture="]): return True
+    if any(low.split("?")[0].endswith(ext) for ext in _IMG_EXT):
+        return True
+    # một số CDN không có đuôi nhưng có tham số kiểu ảnh
+    if any(k in low for k in ["format=webp","image/","img=","photo=","picture="]):
+        return True
     return False
 
 def _filter_good_urls(urls: Iterable[str]) -> List[str]:
     out = []
     for u in urls:
-        if not u or u in EXACT_BLACKLIST: continue
-        p = urlparse(u); host = (p.netloc or "").lower(); path = (p.path or "").lower()
-        if not (_looks_like_image_url(u)): continue
-        if any(bad in host for bad in HOST_BLACKLIST_SUBSTR): continue
-        if any(bad in path for bad in PATH_BLACKLIST_SUBSTR): continue
+        if not u or u in EXACT_BLACKLIST:
+            continue
+
+        # 🚫 BỎ QUA data URI & scheme lạ
+        if u.startswith("data:"):
+            continue
+
+        p = urlparse(u)
+        scheme = (p.scheme or "").lower()
+        if scheme and scheme not in ("http", "https"):
+            continue
+
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+
+        if not (_looks_like_image_url(u)):
+            continue
+        if any(bad in host for bad in HOST_BLACKLIST_SUBSTR):
+            continue
+        if any(bad in path for bad in PATH_BLACKLIST_SUBSTR):
+            continue
+
         fname = path.rsplit("/", 1)[-1]
-        if any(kw in fname for kw in NAME_BLACKLIST_KEYWORDS): continue
+        if any(kw in fname for kw in NAME_BLACKLIST_KEYWORDS):
+            continue
+
+        # Bỏ ảnh rất nhỏ qua query
         try:
             q = parse_qs(p.query or "")
             if "w" in q and int(q["w"][0]) < 320: continue
             if "width" in q and int(q["width"][0]) < 320: continue
-        except: pass
+            if "h" in q and int(q["h"][0]) < 320: continue
+            if "height" in q and int(q["height"][0]) < 320: continue
+        except:
+            pass
+
         out.append(u)
     return out
 
@@ -174,11 +221,15 @@ def _score_image(u: str) -> int:
     p = urlparse(u)
     host = (p.netloc or "").lower()
     q = parse_qs(p.query or "")
-    if any(dom in host for dom in ["vnecdn.net", "vnexpress", "thanhnien"]): s += 2
+    if any(dom in host for dom in ["vnecdn.net", "vnexpress", "thanhnien"]):
+        s += 2
     try:
-        if "w" in q and int(q["w"][0]) >= 800: s += 1
-        elif "width" in q and int(q["width"][0]) >= 800: s += 1
-    except: pass
+        if "w" in q and int(q["w"][0]) >= 800:
+            s += 1
+        elif "width" in q and int(q["width"][0]) >= 800:
+            s += 1
+    except:
+        pass
     return s
 
 def _dedup_and_rank(urls: Iterable[str]) -> List[str]:
@@ -190,9 +241,14 @@ def _dedup_and_rank(urls: Iterable[str]) -> List[str]:
     return uniq
 
 def _collect_images_strictly_inside(body_node, base_url: str) -> List[str]:
+    """
+    Chỉ lấy ảnh NẰM BÊN TRONG body_node.
+    Không quét toàn trang, không merge ngoài body.
+    """
     if not body_node:
         return []
 
+    # loại img nằm trong các vùng loại trừ (related/ads/sidebar ...) DÙ CHÚNG ở trong body_node
     excluded_imgs = set()
     for sel in EXCLUDE_WITHIN_BODY:
         for im in body_node.select(f"{sel} img"):
@@ -200,20 +256,22 @@ def _collect_images_strictly_inside(body_node, base_url: str) -> List[str]:
 
     urls = set()
 
+    # IMG
     for img in body_node.find_all("img"):
         if img in excluded_imgs: continue
         cand = _get_img_candidate(img)
         if not cand: continue
-        if cand.startswith("data:"): continue
         if not cand.startswith(("http", "/")): continue
         urls.add(urljoin(base_url, cand.strip()))
 
+    # PICTURE/SOURCE
     for pic in body_node.find_all("picture"):
         for src in pic.find_all("source"):
             cand = _get_img_candidate(src)
             if cand and cand.startswith(("http","/")):
                 urls.add(urljoin(base_url, cand.strip()))
 
+    # FIGURE
     for fig in body_node.find_all("figure"):
         im = fig.find("img")
         if im and im not in excluded_imgs:
@@ -221,11 +279,13 @@ def _collect_images_strictly_inside(body_node, base_url: str) -> List[str]:
             if cand:
                 urls.add(urljoin(base_url, cand.strip()))
 
+    # A[href=*.jpg|png|webp|avif]
     for a in body_node.find_all("a", href=True):
         href = a["href"].strip()
         if _looks_like_image_url(href):
             urls.add(urljoin(base_url, href))
 
+    # style=background-image
     for node in body_node.find_all(style=True):
         cand = _candidate_from_style(node.get("style") or "")
         if cand and cand.startswith(("http","/")):
@@ -316,9 +376,11 @@ def extract_article_vnexpress(html: str, base_url: str) -> Dict[str, Any]:
         if texts:
             body = "\n\n".join(texts)
     if not body:
+        # không có body → vẫn lấy text toàn trang nhưng KHÔNG dùng để lấy ảnh
         texts = _gather_paragraphs(soup)
         body = "\n\n".join(texts) if texts else None
 
+    # Ảnh: chỉ trong body_node; nếu không có, fallback 1 ảnh từ meta
     images = _collect_images_strictly_inside(body_node, base_url) if body_node else []
     if not images:
         images = _meta_images(soup, base_url)[:1]
@@ -354,6 +416,10 @@ def extract_article_thanhnien(html: str, base_url: str) -> Dict[str, Any]:
     author = _extract_author(soup)
 
     return {"title": title, "body": body, "images": images, "author": author}
+
+# =========================
+# Generic fallback
+# =========================
 
 def extract_article_generic(html: str, title_selectors: List[str], body_selectors: List[str], base_url: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")

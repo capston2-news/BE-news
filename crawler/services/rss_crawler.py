@@ -2,12 +2,13 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional, List, Set, Callable
 from datetime import datetime, timezone
-import time, hashlib, re
+import time, hashlib, re, os
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import feedparser
 from pymongo.errors import DuplicateKeyError
+from pymongo import ReturnDocument
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
@@ -103,6 +104,99 @@ def _extract_eic_from_text(text: str) -> Optional[str]:
     return name or None
 
 # =========================
+# Inline import helpers (lưu ngay sang articles)
+# =========================
+
+CATEGORY_RULES = [
+    ("thoi-su", "Thời sự"),
+    ("giai-tri", "Giải trí"),
+    ("the-thao", "Thể thao"),
+    ("suc-khoe", "Sức khỏe"),
+    ("kinh-doanh", "Kinh doanh"),
+    ("the-gioi", "Thế giới"),
+    ("giao-duc", "Giáo dục"),
+]
+
+def _map_category_name_from_rss(rss_url: str) -> str:
+    u = (rss_url or "").lower()
+    for key, name in CATEGORY_RULES:
+        if key in u:
+            return name
+    return "Uncategorized"
+
+def _upsert_article_from_extracted(db, src: dict, ex_doc: dict, allow_update: bool = True, verbose_log=None):
+    """
+    Upsert 1 bài vào articles từ ex_doc (extracted_articles).
+    - Copy: title, content(body_text), published_at, author (→ authors), category (map từ rss_url), images
+    - Key trùng: (site, external_url)
+    """
+    site = src.get("site")
+    rss_url = src.get("rss_url") or ""
+    external_url = ex_doc.get("source_url")
+    title = ex_doc.get("canonical_title")
+    content = ex_doc.get("body_text") or ""
+    published_at = ex_doc.get("published_at")
+    images = ex_doc.get("images") or []
+    author_name = ex_doc.get("author")
+
+    if not (site and external_url and title and content):
+        if verbose_log:
+            verbose_log(f"[SKIP] inline-import thiếu field (site/title/content/url) url={external_url}")
+        return {"skipped": 1}
+
+    # 1) category
+    cat_name = _map_category_name_from_rss(rss_url)
+    cat = db.categories.find_one_and_update(
+        {"name": cat_name},
+        {"$setOnInsert": {"name": cat_name}},
+        upsert=True, return_document=ReturnDocument.AFTER
+    )
+    category_id = cat["_id"]
+
+    # 2) author (có thể None)
+    author_id = None
+    if author_name:
+        a = db.authors.find_one_and_update(
+            {"name": author_name.strip()},
+            {"$setOnInsert": {"name": author_name.strip()}},
+            upsert=True, return_document=ReturnDocument.AFTER
+        )
+        author_id = a["_id"]
+
+    # 3) upsert article
+    filter_doc = {"site": site, "external_url": external_url}
+    set_on_insert = {
+        "created_at": datetime.now(timezone.utc),
+        "is_deleted": False,
+        "status": "published"
+    }
+    set_doc = {
+        "title": title,
+        "content": content,
+        "author_id": author_id,      # có thể None
+        "category_id": category_id,
+        "published_at": published_at,
+        "images": images,            # copy ảnh từ extracted
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    if allow_update:
+        update_doc = {"$setOnInsert": set_on_insert, "$set": set_doc}
+    else:
+        update_doc = {"$setOnInsert": {**set_on_insert, **set_doc}}
+
+    res = db.articles.update_one(filter_doc, update_doc, upsert=True)
+    if res.matched_count == 0 and res.upserted_id is not None:
+        if verbose_log: verbose_log(f"[OK]   INLINE INSERT | {title}")
+        return {"inserted": 1}
+    elif allow_update and res.modified_count > 0:
+        if verbose_log: verbose_log(f"[OK]   INLINE UPDATE | {title}")
+        return {"updated": 1}
+    else:
+        if verbose_log: verbose_log(f"[SKIP] INLINE EXIST  | {title}")
+        return {"skipped": 1}
+
+# =========================
 # Main crawl logic
 # =========================
 
@@ -163,6 +257,11 @@ def crawl_rss_source(
                 existing.add(doc["source_url"])
 
         for idx, e in enumerate(entries, start=1):
+            # (tuỳ chọn) dừng mềm bằng file flag
+            if os.path.exists("STOP_RSS.txt"):
+                if log: log("[STOP] Phát hiện file STOP_RSS.txt — dừng tiến trình crawl.")
+                break
+
             url = getattr(e, "link", None)
             if not url or not url.startswith("http"):
                 if log: log(f"[SKIP] #{idx:02d} URL không hợp lệ")
@@ -239,6 +338,7 @@ def crawl_rss_source(
                         crawl_runs.update_one({"_id": run_id}, {"$push": {"stats_debug": {"url": url, "reason": "no_title_or_body"}}})
                         if log: log(f"[ERROR]#{idx:02d} Thiếu title/body: {url}")
                     else:
+                        # insert extracted
                         ex_doc = {
                             "source_id": source_id,
                             "raw_page_id": raw_pages.find_one({"source_id": source_id, "url": url}, {"_id":1})["_id"],
@@ -259,6 +359,17 @@ def crawl_rss_source(
                             extracted.insert_one(ex_doc)
                             saved += 1
                             if log: log(f"[OK]   #{idx:02d} EXTRACTED | title='{title}' | imgs={len(images)} | author='{author or 'NULL'}'")
+                            # upsert trực tiếp sang articles (inline-import)
+                            try:
+                                _upsert_article_from_extracted(
+                                    db=db,
+                                    src=source,
+                                    ex_doc=ex_doc,
+                                    allow_update=True,   # đổi False nếu không muốn cập nhật bản ghi cũ
+                                    verbose_log=log
+                                )
+                            except Exception as iex:
+                                if log: log(f"[ERROR]#{idx:02d} INLINE-IMPORT exception: {iex}")
                         except DuplicateKeyError:
                             skipped += 1
                             if log: log(f"[SKIP] #{idx:02d} EXTRACTED trùng: {url}")

@@ -4,7 +4,8 @@ from api.db import get_db
 from datetime import datetime, timezone
 from pymongo import ReturnDocument
 
-def _now(): return datetime.now(timezone.utc)
+def _now():
+    return datetime.now(timezone.utc)
 
 # map slug từ rss_url sang tên category
 CATEGORY_RULES = [
@@ -50,7 +51,8 @@ class Command(BaseCommand):
         source_id = src["_id"]
         site = src.get("site")
         rss_url = src.get("rss_url") or ""
-        if verbose: self.stdout.write(f"Importing from extracted for source='{name_source}' site='{site}'")
+        if verbose:
+            self.stdout.write(f"Importing from extracted for source='{name_source}' site='{site}'")
 
         # 1) Category upsert by name
         cat_name = map_category_name_from_rss(rss_url)
@@ -76,9 +78,12 @@ class Command(BaseCommand):
             author_name = ex.get("author")
             external_url = ex.get("source_url")
             published_at = ex.get("published_at")
+            images = ex.get("images") or []   # <-- NEW: lấy images từ extracted_articles
+
             if not title or not content or not external_url:
                 skipped += 1
-                if verbose: self.stdout.write(self.style.WARNING(f"[SKIP] thiếu title/content/url: {external_url}"))
+                if verbose:
+                    self.stdout.write(self.style.WARNING(f"[SKIP] thiếu title/content/url: {external_url}"))
                 continue
 
             # 3) upsert author nếu có (có thể None)
@@ -101,27 +106,33 @@ class Command(BaseCommand):
             set_doc = {
                 "title": title,
                 "content": content,
-                "author_id": author_id,     # có thể None (schema đã cho phép)
+                "author_id": author_id,     # có thể None
                 "category_id": category_id,
                 "published_at": published_at,
+                "images": images,           # <-- NEW: lưu images sang articles
                 "updated_at": _now(),
             }
+
             if allow_update:
                 update_doc = {"$setOnInsert": set_on_insert, "$set": set_doc}
             else:
+                # chỉ set khi insert mới; không đè dữ liệu cũ
                 update_doc = {"$setOnInsert": {**set_on_insert, **set_doc}}
 
             res = db.articles.update_one(filter_doc, update_doc, upsert=True)
             if res.matched_count == 0 and res.upserted_id is not None:
                 inserted += 1
-                if verbose: self.stdout.write(self.style.SUCCESS(f"[OK]   INSERT | {title}"))
+                if verbose:
+                    self.stdout.write(self.style.SUCCESS(f"[OK]   INSERT | {title}"))
             else:
                 if allow_update and res.modified_count > 0:
                     updated += 1
-                    if verbose: self.stdout.write(self.style.SUCCESS(f"[OK]   UPDATE | {title}"))
+                    if verbose:
+                        self.stdout.write(self.style.SUCCESS(f"[OK]   UPDATE | {title}"))
                 else:
                     skipped += 1
-                    if verbose: self.stdout.write(self.style.WARNING(f"[SKIP] EXIST | {title}"))
+                    if verbose:
+                        self.stdout.write(self.style.WARNING(f"[SKIP] EXIST | {title}"))
 
         self.stdout.write(self.style.SUCCESS(
             f"Import done: total={total} inserted={inserted} updated={updated} skipped={skipped}"

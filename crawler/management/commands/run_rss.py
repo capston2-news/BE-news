@@ -1,3 +1,9 @@
+# python manage.py run_rss --all --limit 2 --auto-import --verbose
+
+# tất cả nguồn active
+# python manage.py run_rss --all --limit 0 --verbose \
+#   --auto-import --import-verbose --import-update
+
 # -*- coding: utf-8 -*-
 from django.core.management.base import BaseCommand, CommandError
 from django.core.management import call_command
