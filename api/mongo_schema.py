@@ -89,12 +89,22 @@ def ensure_collections_and_indexes():
         "properties":{
             "_id":{"bsonType":"objectId"},
             "name":{"bsonType":"string"},
+            "slug":{"bsonType":["string","null"]},
             "category_id":{"bsonType":"objectId"}  # FK -> categories._id
         }
     }
     category_child = _create_or_update_collection("category_child", category_child_validator)
-    category_child.create_index([("name", ASCENDING)], name="ux_category_child_name", unique=True)
+    category_child.create_index(
+        [("category_id", ASCENDING), ("name", ASCENDING)],
+        name="ux_category_child_category_name",
+        unique=True,
+    )
     category_child.create_index([("category_id", ASCENDING)], name="ix_category_child_category_id")
+    category_child.create_index(
+    [("category_id", ASCENDING), ("slug", ASCENDING)],
+    name="ux_category_child_category_slug",
+    unique=True,
+    )
 
     # ───────────────────────── authors ─────────────────────────
     authors_validator = {
@@ -168,11 +178,11 @@ def ensure_collections_and_indexes():
     # ───────────────────────── comments ─────────────────────────
     comments_validator = {
         "bsonType":"object",
-        "required":["article_id","user_id","content","is_deleted"],
+        "required":["article_id","username","content","is_deleted"],
         "properties":{
             "_id":{"bsonType":"objectId"},
             "article_id":{"bsonType":"objectId"},  # -> articles._id
-            "user_id":{"bsonType":"objectId"},     # -> users._id
+            "username":{"bsonType":"string"},     # -> users._id
             "content":{"bsonType":"string"},
             "created_at":{"bsonType":["date","string"]},
             "is_deleted":{"bsonType":"bool"}
@@ -180,7 +190,7 @@ def ensure_collections_and_indexes():
     }
     comments = _create_or_update_collection("comments", comments_validator)
     comments.create_index([("article_id", ASCENDING)], name="ix_comments_article_id")
-    comments.create_index([("user_id", ASCENDING)], name="ix_comments_user_id")
+    comments.create_index([("username", ASCENDING)], name="ix_comments_username")
 
     # ───────────────────────── bookmarks ─────────────────────────
     bookmarks_validator = {

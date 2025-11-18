@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from .db import get_db
 from .mongo_auth import make_tokens
 from .permissions import IsAuthenticated
+from zoneinfo import ZoneInfo
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -121,7 +122,7 @@ class RegisterMongo(APIView):
             "password": make_password(d["password"]),
             "fullname": d["fullname"],
             "age": int(d["age"]),
-            "created_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")),
             "is_active": True,
             "is_deleted": False,
             "role": "user",  # <-- luôn là user, bỏ mọi input role từ FE

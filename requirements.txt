@@ -9,5 +9,14 @@
 # feedparser == 6.0.12          # Dùng để đọc dữ liệu RSS/XML
 # requests == 2.32.3            # Dùng để tải nội dung HTML của từng bài viết
 # beautifulsoup4 == 4.12.3      # Dùng để phân tích (parse) HTML và lấy phần nội dung chính
+# scikit-learn>=1.5
+# scipy>=1.13
+# implicit>=0.7
+# numpy>=2.0
+# chromadb>=0.5.5
+# sentence-transformers>=3.0.0
+# torch>=2.2.0
+# numpy>=1.26
 
 # (Mongo-native): User nằm hoàn toàn ở Mongo + JWT tự tạo (không đụng Django User)
+

@@ -43,6 +43,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'crawler.apps.CrawlerConfig',
+    'recommender.apps.RecommenderConfig'
 ]
 
 MIDDLEWARE = [
@@ -58,10 +59,9 @@ MIDDLEWARE = [
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",   # FE dev (Vite)
-    "http://localhost:3000",   # FE dev (CRA/Next)
 ]
 
-CORS_ALLOW_CREDENTIALS = True  # cho phép cookie qua CORS
+CORS_ALLOW_CREDENTIALS = True # cho phép cookie qua CORS
 
 ROOT_URLCONF = 'config.urls'
 
@@ -109,7 +109,11 @@ REFRESH_COOKIE_NAME = "refresh_token"
 COOKIE_SECURE   = True               # True trên production (HTTPS)
 COOKIE_SAMESITE = "None"               # "None" nếu FE khác domain + HTTPS
 # COOKIE_DOMAIN   = None           # ví dụ ".yourdomain.com" khi deploy, còn dev để None
-
+REC_ARTIFACT_DIR = os.getenv("REC_ARTIFACT_DIR", str(BASE_DIR / "artifacts"))
+CHROMA_DIR = os.getenv("CHROMA_DIR", str(BASE_DIR / "chroma_store"))
+SENTENCE_MODEL = os.getenv("SENTENCE_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+os.makedirs(REC_ARTIFACT_DIR, exist_ok=True)
+os.makedirs(CHROMA_DIR, exist_ok=True)
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
