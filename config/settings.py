@@ -43,7 +43,8 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'crawler.apps.CrawlerConfig',
-    'recommender.apps.RecommenderConfig'
+    'recommender.apps.RecommenderConfig',
+    'chatbot.apps.ChatbotConfig'
 ]
 
 MIDDLEWARE = [
@@ -177,3 +178,8 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Text to speech
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+

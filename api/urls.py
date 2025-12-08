@@ -23,6 +23,8 @@ urlpatterns = [
        
     path("articles/all/", views.PublicGetAllArticles.as_view(), name="get-all-articles" ),
     path("articles/category/<str:slug>/", views.PublicGetArticlesByCategory.as_view(), name="get-articles-by-category" ),
+
+    path("article/child/<str:slug>/", views.FindArticleByCategoryChild.as_view(), name = "get-articles-by-category-children"),
     path("articles/category/<str:category_slug>/child/<str:child_slug>/", views.PublicGetArticlesByCategoryChild.as_view(), name="get-articles-by-category-child" ),
     # path("articles/search-title/", views.FindArticlesByTitle.as_view(), name="find-articles-by-title" ),
     path("bookmark/articles/user/<str:article_id>", views.BookmarkArticle.as_view(), name="bookmark_article_by_id"),
@@ -31,4 +33,7 @@ urlpatterns = [
     path("article/comments", views.CommentOfUser.as_view(), name="article_comments_bulk"),
     path("article/<str:article_id>", views.GetArticleById.as_view(), name = "get_article_by_id"),
     path("article/expect/<str:article_id>", views.GetArticleExpectForArticleById.as_view(), name="article_expect_for_article_by_id"),
+
+    path("article/text/sound", views.TextToSpeech.as_view(), name = "text-to-speech"),
+    path("tts/audio/<str:filename>/", views.tts_audio_stream, name="tts_audio_stream"),
 ]

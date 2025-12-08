@@ -7,9 +7,13 @@ from datetime import datetime, timezone, time
 from zoneinfo import ZoneInfo
 from .permissions import AllowAny, IsAuthenticated, RoleRequired
 from bson import json_util, ObjectId
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse, JsonResponse, Http404
 from zoneinfo import ZoneInfo
 import re
+import os, uuid, json
+from django.conf import settings
+import mimetypes
+from google.cloud import texttospeech
 
 VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
@@ -74,6 +78,7 @@ class PublicGetAllArticles(APIView):
 
 class PublicGetArticlesByCategory(APIView):
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     def get(self, request, slug):
         db = get_db()
@@ -431,5 +436,127 @@ class GetArticleExpectForArticleById(APIView):
         json_data = json_util.dumps(related_articles)
         return HttpResponse(json_data, content_type="application/json")
 
+class TextToSpeech(APIView):
+    permission_classes = [AllowAny]
 
+    def post(self, request):
+        # Lấy text và lang từ body JSON
+        text = (request.data.get("text") or "").strip()
+        lang = (request.data.get("lang") or "vi").strip()  # "vi" hoặc "en"
+
+        if not text:
+            return Response({"detail": "Text is required"}, status=400)
+
+        # chọn language_code
+        if lang == "vi":
+            language_code = "vi-VN"
+        else:
+            language_code = "en-US"
+
+        try:
+            # client sẽ tự đọc GOOGLE_APPLICATION_CREDENTIALS từ env
+            client = texttospeech.TextToSpeechClient()
+
+            synthesis_input = texttospeech.SynthesisInput(text=text)
+
+            voice_params = texttospeech.VoiceSelectionParams(
+                language_code=language_code,
+                ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,  # giọng nữ
+            )
+
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.MP3,
+                speaking_rate=1.0,
+                pitch=0.0,
+            )
+
+            response = client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice_params,
+                audio_config=audio_config,
+            )
+
+            # Lưu file mp3
+            out_dir = os.path.join(settings.MEDIA_ROOT, "tts")
+            os.makedirs(out_dir, exist_ok=True)
+
+            filename = f"tts_{uuid.uuid4().hex}.mp3"
+            full_path = os.path.join(out_dir, filename)
+            with open(full_path, "wb") as f:
+                f.write(response.audio_content)
+
+            # Đường dẫn mới: đi qua view stream có hỗ trợ Range
+            audio_url = f"/api/tts/audio/{filename}"
+
+            return Response({"audio_url": audio_url}, status=201)
+
+        except Exception as e:
+            return Response(
+                {"detail": f"Error generating audio: {e}"},
+                status=500,
+            )
+
+def tts_audio_stream(request, filename):
+    """
+    Stream file mp3 với hỗ trợ HTTP Range để <audio> tua được.
+    """
+    file_path = os.path.join(settings.MEDIA_ROOT, "tts", filename)
+    if not os.path.exists(file_path):
+        raise Http404("Audio not found")
+
+    file_size = os.path.getsize(file_path)
+    content_type, _ = mimetypes.guess_type(file_path)
+    content_type = content_type or "audio/mpeg"
+
+    # Lấy header Range: bytes=start-end
+    range_header = request.META.get("HTTP_RANGE", "").strip()
+    range_match = re.match(r"bytes=(\d+)-(\d*)", range_header) if range_header else None
+
+    if range_match:
+        # Có Range → trả 206 Partial Content
+        first_byte = int(range_match.group(1))
+        last_byte = range_match.group(2)
+
+        if last_byte:
+            last_byte = int(last_byte)
+        else:
+            last_byte = file_size - 1
+
+        if last_byte >= file_size:
+            last_byte = file_size - 1
+
+        length = last_byte - first_byte + 1
+
+        with open(file_path, "rb") as f:
+            f.seek(first_byte)
+            data = f.read(length)
+
+        resp = HttpResponse(data, status=206, content_type=content_type)
+        resp["Content-Length"] = str(length)
+        resp["Content-Range"] = f"bytes {first_byte}-{last_byte}/{file_size}"
+    else:
+        # Không có Range → trả full file (200)
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        resp = HttpResponse(data, content_type=content_type)
+        resp["Content-Length"] = str(file_size)
+
+    # Cho browser biết có thể send Range
+    resp["Accept-Ranges"] = "bytes"
+    return resp
+
+class FindArticleByCategoryChild(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, slug):
+        db = get_db()
+        category_child = db["category_child"].find_one({"slug": slug})
+        if not category_child:
+            return Response({"detail": "Category not found"}, status=404)
+
+        articles = list(db["articles"].find({"category_child_id": category_child["_id"]}).sort("created_at", -1))
+        json_data = json_util.dumps(articles)
+        return HttpResponse(json_data, content_type="application/json")
 
