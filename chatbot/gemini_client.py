@@ -1,6 +1,5 @@
 # chatbot/gemini_client.py
 import os
-import json
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -8,7 +7,7 @@ from google.genai import types
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
-# 👉 DÙNG LẠI gemini-2.5-flash (model này project em đang có)
+# Dùng gemini-2.5-flash làm default
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 if not API_KEY:
@@ -21,7 +20,7 @@ BOT_NAME = "Nana – Trợ lý Tin Tức"
 
 def chat_generic(message: str, history=None) -> str:
     """
-    Gọi Gemini cho chatbot, trả về RAW TEXT (JSON string) theo schema:
+    Gọi Gemini cho chatbot, trả về RAW TEXT (JSON string) với schema:
 
     {
       "action": "CHAT" | "GET_ARTICLES" | "SUMMARIZE_ARTICLE",
@@ -48,7 +47,7 @@ You are {BOT_NAME}, a friendly multilingual news assistant.
 - If the user mixes languages, choose the main language of the question
   or match the language they seem to prefer.
 
-VERY IMPORTANT:
+VERY IMPORTANT – OUTPUT FORMAT:
 Always respond in pure JSON (no markdown, no extra text, no explanation)
 with exactly this schema:
 
@@ -64,96 +63,118 @@ with exactly this schema:
   }}
 }}
 
-Semantics of filters:
+Filter semantics:
 - time_range:
     "today"       -> user asks for today's news / latest today
     "last_7_days" -> user asks for recent news this week, last few days
-    null          -> no explicit time filter
+    null          -> no time filter
 - region:
-    "vietnam" -> news in Vietnam / domestic news / 'tin trong nước'
+    "vietnam" -> domestic news / 'tin trong nước'
     "world"   -> international news / 'tin quốc tế'
-    null      -> no explicit region filter
-- locations:
-    list of city/province slugs if user mentions one or more places.
+    null      -> no region filter
+- locations: city/province slugs:
+    - lowercase
+    - no accents
+    - spaces -> hyphens
     Examples:
-      ["da-nang"]
-      ["da-nang", "sai-gon"]
-      ["ha-noi"]
+      "Đà Nẵng" -> "da-nang"
+      "Sài Gòn" -> "sai-gon"
+      "Hà Nội"  -> "ha-noi"
 - keywords:
-    list of main entities or topics the user is asking about
-    (persons, teams, objects, etc.), in lowercase.
+    main entities/topics in user's request (persons, teams, objects...)
+    all lowercase.
     Examples:
       ["messi"]
       ["ronaldo"]
       ["messi", "ronaldo"]
 
-Slug rules:
+Category slug rules:
 - lowercase
-- spaces -> hyphens
 - no accents
-Examples:
+- spaces -> hyphens
   "Thời sự"   -> "thoi-su"
   "Thể thao"  -> "the-thao"
   "Bóng đá"   -> "bong-da"
-  "Đà Nẵng"   -> "da-nang"
-  "Sài Gòn"   -> "sai-gon"
-  "Hà Nội"    -> "ha-noi"
 
-Rules for GET_ARTICLES:
+VERY IMPORTANT – HOW TO USE HISTORY:
 
-1) If the user asks to list/show news or articles
-   (e.g. in Vietnamese:
-       "tin tức nổi bật hôm nay",
-       "các tin tức thời sự",
-       "tin thời sự nổi bật ở Đà Nẵng và Sài Gòn",
-       "tin bóng đá ở Đà Nẵng",
-       "các bài viết về messi",
-       "tin trong nước hôm nay",
-    or in English:
-       "today's top news",
-       "domestic news",
-       "football news in Da Nang",
-       "breaking news in Vietnam today",
-       "articles about Messi",
-   ),
+- You see the full conversation history (user + assistant messages).
+- Use it to understand context (location, time, topic).
+- EVERY TIME you output action = "GET_ARTICLES", you must output a FULL FILTER SET
+  for THIS TURN. Do not rely on backend to remember filters for you.
+
+Examples:
+1) If previous turn: "tin tức ở Đà Nẵng hôm nay"
+   and current turn: "còn bóng đá thì sao?"
+   You may output:
+   {{
+     "action": "GET_ARTICLES",
+     "reply": "...",
+     "category_slug": "the-thao" or "bong-da",
+     "filters": {{
+       "time_range": "today",
+       "region": "vietnam",
+       "locations": ["da-nang"],
+       "keywords": ["bong da"]
+     }}
+   }}
+
+2) If previous turn: "báo thời sự"
+   and current turn: "các bài viết về messi"
+   You MUST treat it as a new topic 'messi':
+   - Usually set "category_slug": null (unless user clearly says "thời sự về messi")
+   - Filters example:
+     "filters": {{
+       "time_range": null,
+       "region": null,
+       "locations": [],
+       "keywords": ["messi"]
+     }}
+
+Rules for actions:
+
+1) GET_ARTICLES:
+   If the user asks to list/show news/articles, like:
+     - "tin tức nổi bật hôm nay"
+     - "các tin tức thời sự"
+     - "tin thời sự nổi bật ở Đà Nẵng và Sài Gòn"
+     - "tin bóng đá ở Đà Nẵng"
+     - "các bài viết về messi"
+     - "news about Messi"
+     - "breaking news in Vietnam today"
    then:
-     - set "action" = "GET_ARTICLES"
-     - set "reply" = a short confirmation in the user's language,
-     - set "category_slug" when the user clearly specifies a topic/category,
-       using slug rules above.
-     - set filters best-guess for time_range, region, locations, keywords.
+     - action = "GET_ARTICLES"
+     - reply  = short confirmation in user's language
+     - category_slug = best guess if user clearly indicates a topic/category
+     - filters = FULL FILTER SET for this turn only.
 
-Rules for SUMMARIZE_ARTICLE:
-
-2) If the user asks to summarize the article they are currently reading
-   (e.g.:
-       "tóm tắt bài viết đang đọc",
-       "tóm tắt bài báo này",
-       "tóm tắt bài viết này",
-       "summarize this article",
-       "summarize the article I'm reading",
-   ),
+2) SUMMARIZE_ARTICLE:
+   If the user asks to summarize the article they are currently reading:
+     - "tóm tắt bài viết đang đọc"
+     - "tóm tắt bài báo này"
+     - "summarize this article"
    then:
-     - set "action"        = "SUMMARIZE_ARTICLE"
-     - set "reply"         = a short confirmation in the user's language
-     - set "category_slug" = null
-     - set "filters"       = {{
+     - action        = "SUMMARIZE_ARTICLE"
+     - reply         = short confirmation
+     - category_slug = null
+     - filters       = {{
          "time_range": null,
          "region": null,
          "locations": [],
          "keywords": []
        }}
 
-3) For all other questions (small talk, explanations, etc.):
-     - set "action"        = "CHAT"
-     - set "category_slug" = null
-     - set "filters"       = {{
+3) CHAT:
+   For all other requests (small talk, explanations, etc.):
+     - action        = "CHAT"
+     - category_slug = null
+     - filters       = {{
          "time_range": null,
          "region": null,
          "locations": [],
          "keywords": []
        }}
-     - set "reply"         = your normal answer.
+     - reply         = your normal answer for the user.
 
 Output MUST be valid JSON ONLY.
 """
@@ -165,7 +186,7 @@ Output MUST be valid JSON ONLY.
         }
     )
 
-    # Thêm history nếu có
+    # thêm history
     if history:
         for turn in history:
             role = turn.get("role")
@@ -178,7 +199,7 @@ Output MUST be valid JSON ONLY.
             elif role in ("model", "assistant"):
                 contents.append({"role": "model", "parts": [{"text": content}]})
 
-    # Thêm message hiện tại
+    # message hiện tại
     contents.append(
         {
             "role": "user",
@@ -186,13 +207,12 @@ Output MUST be valid JSON ONLY.
         }
     )
 
-    # Gọi Gemini, ép trả về JSON
+    # gọi Gemini, ép JSON
     response = client.models.generate_content(
         model=MODEL,
         contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            # Với chat bình thường, để thinking mặc định cũng được
         ),
     )
 
@@ -201,15 +221,10 @@ Output MUST be valid JSON ONLY.
 
 def summarize_article(content: str, language: str = "vi") -> str:
     """
-    Gọi Gemini để tóm tắt nội dung bài viết.
+    Tóm tắt nội dung bài viết bằng Gemini.
 
-    QUAN TRỌNG: với gemini-2.5-flash, phải tắt 'thinking' nếu không
-    model có thể dùng hết token cho thoughts và không trả text.
-
-    - Không ép JSON, chỉ yêu cầu model trả plain text.
-    - Lấy text từ response.text, nếu không có thì đọc từ
-      candidates[*].content.parts[*].text.
-    - Nếu vẫn không có thì trả message fallback (không ném lỗi).
+    - TẮT 'thinking' để tránh tốn token không có text.
+    - Không ép JSON, chỉ lấy plain text.
     """
     if not content:
         return "Không có nội dung bài viết để tóm tắt."
@@ -217,13 +232,13 @@ def summarize_article(content: str, language: str = "vi") -> str:
     if language == "en":
         instr = (
             "Summarize the following news article in clear, concise English, "
-            "in about 8–10 sentences. Focus on the main facts and key points. "
+            "in about 10–12 sentences. Focus on the main facts and key points. "
             "Answer with plain text only."
         )
     else:
         instr = (
             "Hãy tóm tắt bài báo tin tức dưới đây bằng tiếng Việt, "
-            "khoảng 8–10 câu, dễ hiểu, tập trung vào các ý chính và bối cảnh quan trọng. "
+            "khoảng 10-12 câu, dễ hiểu, tập trung vào các ý chính và bối cảnh quan trọng. "
             "Chỉ trả về phần tóm tắt dạng text thuần, không markdown, không JSON."
         )
 
@@ -241,13 +256,12 @@ def summarize_article(content: str, language: str = "vi") -> str:
         response = client.models.generate_content(
             model=MODEL,
             contents=contents,
-            # ❗ TẮT THINKING để không bị ăn hết token mà không có text
             config=types.GenerateContentConfig(
                 max_output_tokens=512,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        # Nếu cần debug thêm:
+        # debug nếu cần:
         # print("DEBUG_SUMMARY_RESPONSE:", response)
     except Exception as e:
         if language == "en":
@@ -277,7 +291,7 @@ def summarize_article(content: str, language: str = "vi") -> str:
     if collected:
         return "\n".join(collected)
 
-    # 3) Fallback cuối cùng: không có text nào từ model
+    # 3) Fallback cuối
     if language == "en":
         return "Sorry, I couldn’t generate a summary for this article right now."
     return (
