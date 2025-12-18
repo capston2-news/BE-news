@@ -60,6 +60,7 @@ MIDDLEWARE = [
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",   # FE dev (Vite)
+    "http://localhost:3000",   # FE dev (CRA/Next)
 ]
 
 CORS_ALLOW_CREDENTIALS = True # cho phép cookie qua CORS

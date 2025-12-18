@@ -3,13 +3,16 @@ from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny
+from api.permissions import AllowAny, IsAuthenticated, RoleRequired
 from .services.user_profile  import get_user_top_categories
 from .services.embeddings import load_embedder
 from .services.chroma_store import get_client, get_articles_collection
 from .services.user_profile import build_or_get_user_profile
 from .services.hybrid import hybrid_recommend
 from .services.similar import similar_by_article, user_topic_feed
+from api.db import get_db
+
+from chatbot.views import get_user_recommendations
 
 from datetime import datetime, timezone
 from bson import ObjectId
@@ -37,7 +40,7 @@ class HybridRecommendView(APIView):
         embedder = load_embedder(settings.SENTENCE_MODEL)
         client = get_client(settings.CHROMA_DIR)
         coll = get_articles_collection(client)
-        db = settings.MONGO_DB
+        db = get_db()
 
         profile = build_or_get_user_profile(db, user_id, embedder)
         results = hybrid_recommend(
@@ -59,35 +62,33 @@ class SimilarByArticleView(APIView):
 
         embedder = load_embedder(settings.SENTENCE_MODEL)
         coll = get_articles_collection(get_client(settings.CHROMA_DIR))
-        db = settings.MONGO_DB
+        db = get_db()
         results = similar_by_article(db, coll, embedder, article_id, user_id, topk)
         return Response({"article_id": article_id, "count": len(results), "results": results})
 
 @method_decorator(csrf_exempt, name="dispatch")
 class UserTopicFeedView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated, RoleRequired.any_of("user", "admin", "employee")]
 
     def post(self, request):
+        try:
+            user_oid = ObjectId(request.user.id)
+        except Exception:
+            return Response({"detail": "Invalid user_id"}, status=400)
+
         data = request.data or {}
-        requested_user_id = str(data.get("user_id") or "guest")  # đặt tên rõ ra cho đỡ nhầm
+        requested_user_id = str(user_oid)
         topk = int(data.get("topk", 10))
         min_focus = float(data.get("min_focus", 0.35))
 
-        embedder = load_embedder(settings.SENTENCE_MODEL)
-        coll = get_articles_collection(get_client(settings.CHROMA_DIR))
-        db = settings.MONGO_DB
-
-        results = user_topic_feed(
-            db=db,
-            chroma_collection=coll,
-            embedder=embedder,
+        results = get_user_recommendations(
             user_id=requested_user_id,
             topk=topk,
             min_focus=min_focus,
         )
 
         return Response({
-            "user_id": requested_user_id,  # ✅ luôn trả lại đúng cái client gửi lên
+            "user_id": requested_user_id,
             "count": len(results),
             "results": results,
         })
@@ -143,21 +144,27 @@ def _get_category_child_name(db, child_id):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class LogActivityView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated, RoleRequired.any_of("user", "admin", "employee")]
 
     def post(self, request):
         """
         Body: { "user_id": "...", "article_id": "...", "action": "view|like|share" }
         """
+
+        db = get_db()
+        try:
+            user_oid = ObjectId(request.user.id)
+        except Exception:
+            return Response({"detail": "Invalid user_id"}, status=400)
+
         data = request.data or {}
-        user_id = str(data.get("user_id") or "guest")
+        user_id = str(user_oid)
         article_id = data.get("article_id")
         action = (data.get("action") or "view").lower()
 
         if not article_id:
             return Response({"detail": "article_id required"}, status=400)
 
-        db = settings.MONGO_DB
         try:
             aid = ObjectId(article_id)
         except Exception:

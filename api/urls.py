@@ -23,6 +23,7 @@ urlpatterns = [
        
     path("articles/all/", views.PublicGetAllArticles.as_view(), name="get-all-articles" ),
     path("articles/category/<str:slug>/", views.PublicGetArticlesByCategory.as_view(), name="get-articles-by-category" ),
+    path("category/all/child/<str:category_slug>/", views.GetAllCategoryChildOfCategory.as_view(), name="get-all-category-child-of-category"),
 
     path("article/child/<str:slug>/", views.FindArticleByCategoryChild.as_view(), name = "get-articles-by-category-children"),
     path("articles/category/<str:category_slug>/child/<str:child_slug>/", views.PublicGetArticlesByCategoryChild.as_view(), name="get-articles-by-category-child" ),
@@ -36,4 +37,8 @@ urlpatterns = [
 
     path("article/text/sound", views.TextToSpeech.as_view(), name = "text-to-speech"),
     path("tts/audio/<str:filename>/", views.tts_audio_stream, name="tts_audio_stream"),
+
+    path("categories/all/", views.GetAllCategory.as_view(), name="get_all_category"),
+
+    path("articles/month/", views.TopArticlesThisMonth.as_view(), name ="top_10_articles_this_month"),
 ]

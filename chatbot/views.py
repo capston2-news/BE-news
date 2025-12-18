@@ -22,6 +22,10 @@ from api.db import get_db
 from api.permissions import IsAuthenticated, RoleRequired
 from .gemini_client import chat_generic, summarize_article
 
+from recommender.services.embeddings import load_embedder
+from recommender.services.chroma_store import get_client, get_articles_collection
+from recommender.services.similar import user_topic_feed
+
 
 # --------------------------------------------------------
 # Helpers
@@ -187,6 +191,28 @@ def _generate_tts_audio(text: str, lang: str = "vi"):
     return audio_url
 
 
+def get_user_recommendations(user_id: str, topk: int = 10, min_focus: float = 0.35):
+    """
+    Trả về list bài recommend cho user_id (dạng string ObjectId).
+    Dùng chung cho cả API riêng và chatbot.
+    """
+    db = get_db()
+
+    embedder = load_embedder(settings.SENTENCE_MODEL)
+    coll = get_articles_collection(get_client(settings.CHROMA_DIR))
+
+    results = user_topic_feed(
+        db=db,
+        chroma_collection=coll,
+        embedder=embedder,
+        user_id=user_id,
+        topk=topk,
+        min_focus=min_focus,
+    )
+
+    return results
+
+
 # --------------------------------------------------------
 # New Conversation
 # --------------------------------------------------------
@@ -256,6 +282,7 @@ class ChatbotView(APIView):
         user = request.user
         username = user.username
 
+        # --------- 1. Lấy params cơ bản ---------
         conversation_id = (request.data.get("conversation_id") or "").strip()
         if not conversation_id:
             return Response(
@@ -282,37 +309,6 @@ class ChatbotView(APIView):
         }
         conv_history = conv.get("history", [])
         last_filters = conv.get("last_filters") or {}
-
-        history_for_gemini = _build_gemini_history(conv_history)
-
-        # 1. Gọi Gemini
-        try:
-            raw = chat_generic(message, history=history_for_gemini)
-        except Exception as e:
-            return Response(
-                {"detail": f"Gemini error: {e}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        # 2. Parse JSON từ Gemini
-        clean_raw = _strip_markdown_fence(raw)
-
-        action = "CHAT"
-        reply_text = clean_raw
-        category_slug = None
-        filters_from_gemini = {}
-
-        try:
-            data = json.loads(clean_raw)
-            action = data.get("action", "CHAT")
-            reply_text = data.get("reply", "") or clean_raw
-            category_slug = data.get("category_slug")
-            filters_from_gemini = data.get("filters") or {}
-        except Exception:
-            action = "CHAT"
-            reply_text = raw
-            category_slug = None
-            filters_from_gemini = {}
 
         now = datetime.utcnow()
 
@@ -348,9 +344,142 @@ class ChatbotView(APIView):
                 upsert=True,
             )
 
-        # --------------------------------------------------------
-        # 3. SUMMARIZE_ARTICLE – tóm tắt bài viết
-        # --------------------------------------------------------
+        # =======================================================
+        # 2. XỬ LÝ RIÊNG CÂU HỎI “HÔM NAY LÀ NGÀY MẤY”
+        #    (KHÔNG GỌI GEMINI, DÙNG THỜI GIAN THỰC)
+        # =======================================================
+        lower_msg = message.lower()
+        date_phrases = [
+            "hôm nay là ngày mấy",
+            "hôm nay ngày mấy",
+            "hôm nay là ngày bao nhiêu",
+            "hôm nay ngày bao nhiêu",
+            "today's date",
+            "what is today's date",
+        ]
+        if any(p in lower_msg for p in date_phrases):
+            now_local = timezone.now()
+            d = now_local.day
+            m = now_local.month
+            y = now_local.year
+            reply_text = f"Hôm nay là ngày {d} tháng {m} năm {y}."
+            save_history(message, reply_text)
+            return Response({"reply": reply_text}, status=status.HTTP_200_OK)
+
+        # =======================================================
+        # 3. TIN TỨC THEO NGÀY CỤ THỂ (HÔM QUA / NGÀY dd/mm(/yyyy))
+        #    VÍ DỤ: "tin tức ngày hôm qua", "tin tức ngày 4/12"
+        #    -> TRUY VẤN TRỰC TIẾP MONGO, KHÔNG GỌI GEMINI
+        # =======================================================
+        if "tin tức" in lower_msg or "tin tuc" in lower_msg:
+            target_date = None
+            now_local = timezone.now()
+
+            # 3.1. "hôm qua"
+            if "hôm qua" in lower_msg or "hom qua" in lower_msg:
+                target_date = (now_local - timedelta(days=1)).date()
+            else:
+                # 3.2. Pattern "ngày 4/12" hoặc "ngày 04-12-2025"
+                m = re.search(
+                    r"ngày\s+(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?",
+                    lower_msg
+                )
+                if m:
+                    day = int(m.group(1))
+                    month = int(m.group(2))
+                    year = int(m.group(3)) if m.group(3) else now_local.year
+                    try:
+                        target_date = datetime(year, month, day).date()
+                    except ValueError:
+                        target_date = None
+
+            if target_date is not None:
+                # Khoảng thời gian [00:00; 24:00) cho ngày đó (theo timezone Django)
+                start = timezone.make_aware(
+                    datetime(
+                        target_date.year,
+                        target_date.month,
+                        target_date.day,
+                        0, 0, 0,
+                    ),
+                    timezone.get_current_timezone(),
+                )
+                end = start + timedelta(days=1)
+
+                query = {
+                    "published_at": {"$gte": start, "$lt": end},
+                }
+
+                cursor = (
+                    db["articles"]
+                    .find(query)
+                    .sort("published_at", -1)
+                    .limit(10)
+                )
+                articles_list = list(cursor)
+
+                d, mth, y = target_date.day, target_date.month, target_date.year
+
+                if not articles_list:
+                    reply_text = (
+                        f"Hiện tại mình không tìm thấy tin tức nào cho ngày {d}/{mth}/{y}."
+                    )
+                    save_history(message, reply_text)
+                    return Response(
+                        {
+                            "reply": reply_text,
+                            "articles": [],
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+
+                articles = json.loads(json_util.dumps(articles_list))
+                reply_text = f"Đây là một số tin tức ngày {d}/{mth}/{y}."
+
+                save_history(message, reply_text)
+                return Response(
+                    {
+                        "reply": reply_text,
+                        "articles": articles,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+        # =======================================================
+        # 4. CÁC TRƯỜNG HỢP KHÁC -> GỌI GEMINI
+        # =======================================================
+        history_for_gemini = _build_gemini_history(conv_history)
+
+        try:
+            raw = chat_generic(message, history=history_for_gemini)
+        except Exception as e:
+            return Response(
+                {"detail": f"Gemini error: {e}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        clean_raw = _strip_markdown_fence(raw)
+
+        action = "CHAT"
+        reply_text = clean_raw
+        category_slug = None
+        filters_from_gemini = {}
+
+        try:
+            data = json.loads(clean_raw)
+            action = data.get("action", "CHAT")
+            reply_text = data.get("reply", "") or clean_raw
+            category_slug = data.get("category_slug")
+            filters_from_gemini = data.get("filters") or {}
+        except Exception:
+            action = "CHAT"
+            reply_text = raw
+            category_slug = None
+            filters_from_gemini = {}
+
+        # =======================================================
+        # 5. SUMMARIZE_ARTICLE – tóm tắt bài viết + TTS
+        # =======================================================
         if action == "SUMMARIZE_ARTICLE":
             article_id = (request.data.get("article_id") or "").strip()
 
@@ -428,7 +557,6 @@ class ChatbotView(APIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
-            # tạo audio cho phần tóm tắt
             audio_url = None
             try:
                 audio_url = _generate_tts_audio(summary, lang=language)
@@ -446,9 +574,120 @@ class ChatbotView(APIView):
 
             return Response(resp_data, status=status.HTTP_200_OK)
 
-        # --------------------------------------------------------
-        # 4. GET_ARTICLES – Gemini quyết filter, backend chỉ map → Mongo
-        # --------------------------------------------------------
+
+        # ===== 4. GET_RECOMMENDATIONS – gợi ý theo lịch sử người dùng =====
+        if action == "GET_RECOMMENDATIONS":
+            # Lấy filter từ Gemini
+            time_range = filters_from_gemini.get("time_range")
+            raw_topk = filters_from_gemini.get("topk")
+            raw_min_focus = filters_from_gemini.get("min_focus")
+
+            # topk an toàn (default 10)
+            try:
+                topk = int(raw_topk) if raw_topk not in (None, "") else 10
+            except (TypeError, ValueError):
+                topk = 10
+
+            # min_focus an toàn (default 0.35)
+            try:
+                min_focus = float(raw_min_focus) if raw_min_focus not in (None, "") else 0.35
+            except (TypeError, ValueError):
+                min_focus = 0.35
+
+            db = get_db()
+
+            # user_id cho recommender (dùng ObjectId string như UserTopicFeedView)
+            try:
+                user_oid = ObjectId(request.user.id)
+                requested_user_id = str(user_oid)
+            except Exception:
+                requested_user_id = str(request.user.id)
+
+            # 4.1. Gọi recommender lấy nhiều hơn một xíu để còn lọc theo ngày
+            try:
+                embedder = load_embedder(settings.SENTENCE_MODEL)
+                coll = get_articles_collection(get_client(settings.CHROMA_DIR))
+
+                raw_results = user_topic_feed(
+                    db=db,
+                    chroma_collection=coll,
+                    embedder=embedder,
+                    user_id=requested_user_id,
+                    topk=max(topk * 2, topk),
+                    min_focus=min_focus,
+                )
+            except Exception as e:
+                error_reply = (
+                    reply_text
+                    or "Hiện tại mình chưa thể gợi ý tin tức cho bạn, có lỗi xảy ra."
+                )
+                save_history(message, error_reply)
+                return Response(
+                    {
+                        "reply": error_reply,
+                        "error": str(e),
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            # 4.2. Nếu Gemini có time_range ("today", "last_7_days"...)
+            #      thì lọc tiếp theo published_at
+            start, end = _build_time_range_filter(time_range)
+            if start and end:
+                filtered = []
+                for item in raw_results:
+                    pub_str = item.get("published_at")
+                    if not pub_str:
+                        continue
+                    try:
+                        pub_dt = datetime.fromisoformat(pub_str)
+                        # nếu không có tz thì coi như UTC hoặc local
+                        if pub_dt.tzinfo is None:
+                            pub_dt = timezone.make_aware(pub_dt, timezone.get_current_timezone())
+                    except Exception:
+                        continue
+
+                    if start <= pub_dt < end:
+                        filtered.append(item)
+                    if len(filtered) >= topk:
+                        break
+                rec_results = filtered
+            else:
+                # không lọc theo ngày -> cắt topk
+                rec_results = raw_results[:topk]
+
+            # 4.3. Không có gì để gợi ý
+            if not rec_results:
+                no_rec_reply = (
+                    reply_text
+                    or "Mình chưa tìm được bài viết nổi bật phù hợp với yêu cầu của bạn."
+                )
+                save_history(message, no_rec_reply)
+                return Response(
+                    {
+                        "reply": no_rec_reply,
+                        "articles": [],
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            final_reply = (
+                reply_text
+                or "Mình gợi ý cho bạn một số bài viết nổi bật hôm nay:"
+            )
+            save_history(message, final_reply)
+
+            return Response(
+                {
+                    "reply": final_reply,
+                    "articles": rec_results,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # =======================================================
+        # 6. GET_ARTICLES – dùng filters Gemini map sang Mongo
+        # =======================================================
         if action == "GET_ARTICLES":
             time_range = filters_from_gemini.get("time_range")
             region = filters_from_gemini.get("region")
@@ -456,7 +695,6 @@ class ChatbotView(APIView):
             keywords = filters_from_gemini.get("keywords") or []
 
             slug = category_slug
-
             query = {}
 
             # category cha / con
@@ -494,7 +732,7 @@ class ChatbotView(APIView):
             if start and end:
                 query["published_at"] = {"$gte": start, "$lt": end}
 
-            # region / location
+            # region / location → regex trên title
             title_regex_parts = []
 
             if region == "vietnam" and not locations:
@@ -573,9 +811,9 @@ class ChatbotView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        # --------------------------------------------------------
-        # 5. Còn lại: CHAT bình thường
-        # --------------------------------------------------------
+        # =======================================================
+        # 7. Còn lại: CHAT bình thường
+        # =======================================================
         save_history(message, reply_text)
         return Response({"reply": reply_text}, status=status.HTTP_200_OK)
 

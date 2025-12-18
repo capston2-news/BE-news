@@ -2,8 +2,8 @@
 from typing import List
 from django.conf import settings
 from .embeddings import load_embedder, encode_texts
-from .chroma_store import get_client, get_articles_collection, query_topk
-from .utils import user_recent_article_ids, fetch_articles, article_to_text, get_popular_recent_ids
+from .chroma_store import get_client, get_articles_collection
+from .utils import user_recent_aarticle_ids, fetch_articles, article_to_text, get_popular_recent_ids
 from .rrf import rrf_fuse
 
 def _rank_from_chroma_result(res):

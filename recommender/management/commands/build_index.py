@@ -1,91 +1,179 @@
+from __future__ import annotations
+
 from django.core.management.base import BaseCommand
 from django.conf import settings
+from pymongo import UpdateOne
+from datetime import datetime, timezone
+
+from keybert import KeyBERT
+from api.permissions import AllowAny, IsAuthenticated, RoleRequired
 from recommender.services.embeddings import load_embedder, encode_texts
 from recommender.services.chroma_store import get_client, get_articles_collection, upsert_articles
-from recommender.services.utils import get_all_article_ids, fetch_articles, article_to_text, get_category_name
+from recommender.services.utils import get_all_article_ids, fetch_articles, article_to_text
+from recommender.services.entities import extract_entities_proper, extract_keywords_keybert
+from api.db import get_db
 
-# ⭐️ Cần import MongoClient nếu chưa có trong các file services đã import
-try:
-    from pymongo import MongoClient
-except ImportError:
-    # Nếu không có, bạn cần đảm bảo pymongo được cài đặt
-    pass
+
+def _to_iso_utc(dt) -> str:
+    if not dt:
+        return ""
+    if isinstance(dt, str):
+        return dt
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=None).isoformat()
+    return ""
+
+
+def _resolve_category_name(db, cat_id) -> str:
+    if not cat_id:
+        return ""
+    try:
+        doc = db["categories"].find_one({"_id": cat_id}, {"name": 1, "title": 1})
+        if doc:
+            return (doc.get("name") or doc.get("title") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _meta_safe(d: dict, db) -> dict:
+    cat_name = (d.get("category_name") or "").strip()
+    if not cat_name and d.get("category_id"):
+        cat_name = _resolve_category_name(db, d.get("category_id"))
+
+    pub_ts = None
+    pub = d.get("published_at")
+    if pub and isinstance(pub, datetime):
+        try:
+            pub_ts = int(pub.replace(tzinfo=timezone.utc).timestamp()) if pub.tzinfo is None else int(pub.timestamp())
+        except Exception:
+            pub_ts = None
+
+    entities = d.get("entities") or []
+    keywords = d.get("keywords") or []
+
+    ent_str = ", ".join(entities) if isinstance(entities, list) else str(entities)
+    kw_str = ", ".join(keywords) if isinstance(keywords, list) else str(keywords)
+
+    return {
+        "mongo_id": str(d.get("_id")),
+        "title": (d.get("title") or "").strip(),
+        "source": (d.get("site") or d.get("source") or "").strip(),
+        "url": (d.get("external_url") or d.get("url") or "").strip(),
+        "category": cat_name,
+        "category_child": (d.get("category_child_name") or "").strip(),
+        "published_at": _to_iso_utc(d.get("published_at")),
+        "published_ts": pub_ts,
+        "entities": ent_str,
+        "keywords": kw_str,
+    }
+
+
+def _clean_list(xs, max_n: int) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for x in (xs or []):
+        s = str(x).strip()
+        if len(s) < 3:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+        if len(out) >= max_n:
+            break
+    return out
 
 
 class Command(BaseCommand):
-    help = "Build/refresh ChromaDB index for articles"
+    permission_classes = [AllowAny]
+    help = "Build/refresh ChromaDB index for articles + update Mongo articles.entities/keywords"
 
-    def _meta_safe(self, db_instance, d: dict) -> dict:
-        """Helper function to safely extract metadata."""
-        cat_name = (d.get("category_name") or "").strip()
-
-        # FIX: Sử dụng db_instance thay vì settings.MONGO_DB (string)
-        if not cat_name and d.get("category_id"):
-            cat_name = get_category_name(db_instance, d.get("category_id"))
-
-        pub_ts = None
-        pub = d.get("published_at")
-        if pub:
-            try:
-                pub_ts = int(pub.timestamp())
-            except:
-                pub_ts = None
-
-        return {
-            "mongo_id": str(d["_id"]),
-            "title": (d.get("title") or "").strip(),
-            "author": (d.get("author") or "").strip(),
-            "source": (d.get("source") or "").strip(),
-            "topics": ", ".join([str(x) for x in (d.get("topics") or [])]),
-            "category": (d.get("category_name") or "").strip(),
-            "category_child": (d.get("category_child_name") or "").strip(),
-            "publishd_tse": pub_ts,
-        }
+    def add_arguments(self, parser):
+        parser.add_argument("--batch", type=int, default=256)
+        parser.add_argument("--force", action="store_true", help="Recompute entities/keywords even if exists")
+        parser.add_argument("--skip-mongo-update", action="store_true", help="Do not update Mongo articles, only build Chroma")
 
     def handle(self, *args, **kwargs):
 
-        # ⭐️ FIX START: Khởi tạo PyMongo Client và lấy Database Instance
-        try:
-            # Giả định settings.MONGO_URI chứa connection string
-            mongo_client = MongoClient(settings.MONGO_URI)
+        db = get_db()
 
-            # Lấy đối tượng database instance bằng cách sử dụng tên database (settings.MONGO_DB là tên)
-            db = mongo_client[settings.MONGO_DB]
-
-        except AttributeError:
-            self.stdout.write(
-                self.style.ERROR("FATAL: MONGO_URI hoặc MONGO_DB không được định nghĩa trong settings.py"))
-            return
-        except Exception as e:
-            self.stdout.write(self.style.ERROR(f"FATAL: Không thể kết nối tới MongoDB: {e}"))
-            return
+        batch = int(kwargs.get("batch") or 256)
+        force = bool(kwargs.get("force"))
+        skip_mongo = bool(kwargs.get("skip_mongo_update"))
 
         embedder = load_embedder(settings.SENTENCE_MODEL)
+        kw_model = KeyBERT(model=embedder)
 
-        # FIX: Truyền đối tượng db instance đã kết nối vào hàm
         ids = get_all_article_ids(db)
-        batch = 512
         client = get_client(settings.CHROMA_DIR)
         coll = get_articles_collection(client)
 
-        self.stdout.write(self.style.WARNING(f"Indexing {len(ids)} articles to Chroma..."))
+        self.stdout.write(self.style.WARNING(f"Indexing {len(ids)} articles... batch={batch}, force={force}"))
+
         for i in range(0, len(ids), batch):
             chunk_ids = ids[i:i + batch]
-
-            # FIX: Truyền đối tượng db instance
             docs = fetch_articles(db, chunk_ids)
             docs = [d for d in docs if d]
-            if not docs: continue
+            if not docs:
+                continue
 
+            # A) build entities/keywords + update Mongo (bulk)
+            ops: list[UpdateOne] = []
+            for d in docs:
+                title = (d.get("title") or "").strip()
+                summary = (d.get("summary") or "").strip()
+                content = (d.get("content") or "")
+
+                # entities: rule-based (title + ít content)
+                need_entities = force or not isinstance(d.get("entities"), list) or len(d.get("entities") or []) < 1
+                if need_entities:
+                    ent_text = f"{title}. {summary}".strip()
+                    if len(ent_text) < 25:
+                        ent_text = f"{title}. {content[:600]}".strip()
+                    entities = extract_entities_proper(ent_text, max_entities=10, max_len=8)
+                    entities = _clean_list(entities, 10)
+                    d["entities"] = entities
+
+                # keywords: KeyBERT (title + summary/content)
+                need_keywords = force or not isinstance(d.get("keywords"), list) or len(d.get("keywords") or []) < 3
+                if need_keywords:
+                    kw_text = f"{title}. {summary}".strip()
+                    if len(kw_text) < 40:
+                        kw_text = f"{title}. {content[:900]}".strip()
+                    keywords = extract_keywords_keybert(kw_model, kw_text, top_n=10, min_score=0.28)
+                    keywords = _clean_list(keywords, 10)
+                    d["keywords"] = keywords
+
+                if not skip_mongo and (need_entities or need_keywords):
+                    ops.append(
+                        UpdateOne(
+                            {"_id": d["_id"]},
+                            {"$set": {"entities": d.get("entities", []), "keywords": d.get("keywords", [])}},
+                            upsert=False,
+                        )
+                    )
+
+            if ops and not skip_mongo:
+                try:
+                    db["articles"].bulk_write(ops, ordered=False)
+                except Exception as e:
+                    self.stdout.write(self.style.WARNING(f"bulk_write failed: {e}"))
+
+            # B) upsert Chroma
             documents = [article_to_text(d) for d in docs]
             embeddings = encode_texts(embedder, documents)
             try:
                 embeddings = embeddings.tolist()
-            except:
+            except Exception:
                 pass
 
-            # FIX: Gọi phương thức _meta_safe đã sửa
-            metadatas = [self._meta_safe(db, d) for d in docs]
+            metadatas = [_meta_safe(d, db) for d in docs]
 
             upsert_articles(
                 coll,
@@ -94,6 +182,7 @@ class Command(BaseCommand):
                 metadatas=metadatas,
                 documents=documents,
             )
-            self.stdout.write(self.style.NOTICE(f"Upsert {len(docs)} docs [{i}-{i + len(docs) - 1}]"))
 
-        self.stdout.write(self.style.SUCCESS("✅ Done building Chroma index"))
+            self.stdout.write(self.style.NOTICE(f"Upsert {len(docs)} docs [{i}-{i+len(docs)-1}]"))
+
+        self.stdout.write(self.style.SUCCESS("✅ Done building Chroma index + updated Mongo entities/keywords"))

@@ -1,4 +1,5 @@
 from bson import ObjectId
+from api.db import get_db
 
 # ------- Helpers: lấy tên category & category_child -------
 def get_category_name(db, category_id):

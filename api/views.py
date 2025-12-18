@@ -16,6 +16,7 @@ import mimetypes
 from google.cloud import texttospeech
 
 VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+UTC_TZ = ZoneInfo("UTC")
 
 def _parse_date_yyyy_mm_dd(s: str):
     """Chuyển 'YYYY-MM-DD' thành datetime.date (nếu lỗi thì trả None)."""
@@ -26,90 +27,343 @@ def _parse_date_yyyy_mm_dd(s: str):
 
 class PublicGetAllArticles(APIView):
     permission_classes = [AllowAny]
+    # ✅ ĐỪNG set authentication_classes = [] nếu muốn request.user hoạt động khi có token
 
     def get(self, request):
         db = get_db()
-        title = (request.GET.get("title") or "").strip()
-        created_from = (request.GET.get("created_from") or "").strip()
-        created_to = (request.GET.get("created_to") or "").strip()
-        category_slug = (request.GET.get("category_slug") or "").strip()
-        try:
-            limit = int(request.GET.get("limit", "20"))
-        except ValueError:
-            limit = 20
 
-        # Tạo bộ lọc động
+        title = (request.GET.get("title") or "").strip()
+        published_from = (request.GET.get("published_from") or "").strip()
+        published_to = (request.GET.get("published_to") or "").strip()
+        category_slug = (request.GET.get("category_slug") or "").strip()
+
+        # limit mặc định 400
+        try:
+            limit = int(request.GET.get("limit", "400"))
+        except ValueError:
+            limit = 400
+        # ép trong [1..400]
+        if limit <= 0:
+            limit = 400
+        if limit > 400:
+            limit = 400
+
         mongo_filter = {}
 
-        #Lọc theo tiêu đề
+        # filter title
         if title:
             mongo_filter["title"] = {"$regex": re.compile(re.escape(title), re.IGNORECASE)}
 
-        #Lọc theo thời gian tạo (created_at)
-        created_range = {}
-        if created_from:
-            d = _parse_date_yyyy_mm_dd(created_from)
+        # filter published_at theo ngày VN -> UTC
+        published_range = {}
+        if published_from:
+            d = _parse_date_yyyy_mm_dd(published_from)
             if d:
                 start_vn = datetime.combine(d, time.min, tzinfo=VIETNAM_TZ)
-                created_range["$gte"] = start_vn.astimezone(ZoneInfo("UTC"))
-        if created_to:
-            d = _parse_date_yyyy_mm_dd(created_to)
+                published_range["$gte"] = start_vn.astimezone(UTC_TZ)
+        if published_to:
+            d = _parse_date_yyyy_mm_dd(published_to)
             if d:
                 end_vn = datetime.combine(d, time.max, tzinfo=VIETNAM_TZ)
-                created_range["$lte"] = end_vn.astimezone(ZoneInfo("UTC"))
-        if created_range:
-            mongo_filter["created_at"] = created_range
+                published_range["$lte"] = end_vn.astimezone(UTC_TZ)
+        if published_range:
+            mongo_filter["published_at"] = published_range
 
-        #Lọc theo category cha (slug)
+        # filter theo category_slug (category cha)
         if category_slug:
-            cat = db["categories"].find_one({"slug": category_slug})
+            cat = db["categories"].find_one({"slug": category_slug}, {"_id": 1})
             if not cat:
-                return JsonResponse([], safe=False)
+                return HttpResponse("[]", content_type="application/json")
             mongo_filter["category_id"] = cat["_id"]
 
+        # user để check bookmark
+        user_oid = None
+        if getattr(request, "user", None) and getattr(request.user, "is_authenticated", False):
+            try:
+                user_oid = ObjectId(str(request.user.id))
+            except Exception:
+                user_oid = None
 
-        cursor = db["articles"].find(mongo_filter).sort("created_at", -1)
-        if limit and limit > 0:
-            cursor = cursor.limit(limit)
-        docs = list(cursor)
-        # convert to JSON string safely
-        json_data = json_util.dumps(docs)
-        return HttpResponse(json_data, content_type="application/json")
+        pipeline = [
+            {"$match": mongo_filter},
+            {"$sort": {"published_at": -1}},
+            {"$limit": limit},
+
+            # map category_name
+            {"$lookup": {
+                "from": "categories",
+                "localField": "category_id",
+                "foreignField": "_id",
+                "as": "cat",
+            }},
+            {"$unwind": {"path": "$cat", "preserveNullAndEmptyArrays": True}},
+
+            # map category_child_name (nếu category_child_id != null)
+            {"$lookup": {
+                "from": "category_child",
+                "localField": "category_child_id",
+                "foreignField": "_id",
+                "as": "child",
+            }},
+            {"$unwind": {"path": "$child", "preserveNullAndEmptyArrays": True}},
+        ]
+
+        # check bookmark nếu có user
+        if user_oid:
+            pipeline += [
+                {"$lookup": {
+                    "from": "bookmarks",
+                    "let": {"aid": "$_id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$and": [
+                            {"$eq": ["$article_id", "$$aid"]},
+                            {"$eq": ["$user_id", user_oid]},
+                        ]}}},
+                        {"$limit": 1},
+                    ],
+                    "as": "bm",
+                }},
+                {"$addFields": {"is_bookmarked": {"$gt": [{"$size": "$bm"}, 0]}}},
+            ]
+        else:
+            pipeline += [{"$addFields": {"is_bookmarked": False}}]
+
+        pipeline += [
+            {"$project": {
+                "_id": 1,
+                "site": 1,
+                "title": 1,
+                "images": 1,
+                "content": 1,
+                "published_at": 1,
+
+                "category_id": 1,
+                "category_name": "$cat.name",
+                "category_slug": "$cat.slug",
+
+                "category_child_id": 1,
+                "category_child_name": "$child.name",
+                "category_child_slug": "$child.slug",
+
+                "is_bookmarked": 1,
+            }}
+        ]
+
+        docs = list(db["articles"].aggregate(pipeline))
+        return HttpResponse(json_util.dumps(docs), content_type="application/json")
 
 class PublicGetArticlesByCategory(APIView):
     permission_classes = [AllowAny]
-    authentication_classes = []
 
     def get(self, request, slug):
         db = get_db()
-        category = db["categories"].find_one({"slug": slug})
+
+        category = db["categories"].find_one({"slug": slug}, {"_id": 1, "name": 1})
         if not category:
             return Response({"detail": "Category not found"}, status=404)
-        
-        articles = list(db["articles"].find({"category_id": category["_id"]}).sort("created_at", -1))
-        json_data = json_util.dumps(articles)
-        return HttpResponse(json_data, content_type="application/json")
-    
-class PublicGetArticlesByCategoryChild(APIView):
+
+        try:
+            limit = int(request.GET.get("limit", "400"))
+        except ValueError:
+            limit = 400
+        if limit <= 0:
+            limit = 400
+        if limit > 400:
+            limit = 400
+
+        user_oid = None
+        if getattr(request, "user", None) and getattr(request.user, "is_authenticated", False):
+            try:
+                user_oid = ObjectId(str(request.user.id))
+            except Exception:
+                user_oid = None
+
+        pipeline = [
+            {"$match": {"category_id": category["_id"]}},
+            {"$sort": {"published_at": -1}},
+            {"$limit": limit},
+
+            # map category_name
+            {"$lookup": {
+                "from": "categories",
+                "localField": "category_id",
+                "foreignField": "_id",
+                "as": "cat",
+            }},
+            {"$unwind": {"path": "$cat", "preserveNullAndEmptyArrays": True}},
+
+            # map category_child_name nếu có category_child_id
+            {"$lookup": {
+                "from": "category_child",
+                "localField": "category_child_id",
+                "foreignField": "_id",
+                "as": "child",
+            }},
+            {"$unwind": {"path": "$child", "preserveNullAndEmptyArrays": True}},
+        ]
+
+        if user_oid:
+            pipeline += [
+                {"$lookup": {
+                    "from": "bookmarks",
+                    "let": {"aid": "$_id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$and": [
+                            {"$eq": ["$article_id", "$$aid"]},
+                            {"$eq": ["$user_id", user_oid]},
+                        ]}}},
+                        {"$limit": 1},
+                    ],
+                    "as": "bm",
+                }},
+                {"$addFields": {"is_bookmarked": {"$gt": [{"$size": "$bm"}, 0]}}},
+            ]
+        else:
+            pipeline += [{"$addFields": {"is_bookmarked": False}}]
+
+        # chỉ trả field cần
+        pipeline += [
+            {"$project": {
+                "_id": 1,
+                "site": 1,
+                "title": 1,
+                "images": 1,
+                "content": 1,
+                "published_at": 1,
+
+                "category_id": 1,
+                "category_name": "$cat.name",
+                "category_slug": "$cat.slug",
+
+                "category_child_id": 1,
+                "category_child_name": "$child.name",
+                "category_child_slug": "$child.slug",
+
+                "is_bookmarked": 1,
+            }}
+        ]
+
+        docs = list(db["articles"].aggregate(pipeline))
+        return HttpResponse(json_util.dumps(docs), content_type="application/json")
+
+class GetAllCategoryChildOfCategory(APIView):
     permission_classes = [AllowAny]
-    def get(self, request, category_slug, child_slug):
-        db= get_db()
+    def get(self, request, category_slug):
+        db = get_db()
         category = db["categories"].find_one({"slug": category_slug})
         if not category:
+            return HttpResponse({"detail": "Category not found"}, status=404)
+
+        child_category = list(db["category_child"].find({"category_id": category["_id"]}))
+        return HttpResponse(json_util.dumps(child_category), content_type="application/json")
+
+class PublicGetArticlesByCategoryChild(APIView):
+    permission_classes = [AllowAny]
+    # ✅ ĐỪNG set authentication_classes = [] nếu muốn request.user hoạt động khi user đăng nhập
+
+    def get(self, request, category_slug, child_slug):
+        db = get_db()
+
+        category = db["categories"].find_one({"slug": category_slug}, {"_id": 1, "name": 1, "slug": 1})
+        if not category:
             return Response({"detail": "Category not found"}, status=404)
-        
-        child_category = db["category_child"].find_one({"category_id": category["_id"], "slug": child_slug})
+
+        child_category = db["category_child"].find_one(
+            {"category_id": category["_id"], "slug": child_slug},
+            {"_id": 1, "name": 1, "slug": 1}
+        )
         if not child_category:
             return Response({"detail": "Child category not found"}, status=404)
-        
-        articles = list(db["articles"].find({"category_child_id": child_category["_id"],
-                                              "category_id": category["_id"]}).sort("created_at", -1))
-        json_data = json_util.dumps(articles)
-        return HttpResponse(json_data, content_type="application/json")
 
-# class BookmarkArticle(APIView):
-#     permission_classes = [IsAuthenticated, RoleRequired.any_of("employee", "admin", "user")]
-#     def post(self, request):
+        # limit (mặc định 400, tối đa 400)
+        try:
+            limit = int(request.GET.get("limit", "400"))
+        except ValueError:
+            limit = 400
+        if limit <= 0:
+            limit = 400
+        if limit > 400:
+            limit = 400
+
+        # user để check bookmark
+        user_oid = None
+        if getattr(request, "user", None) and getattr(request.user, "is_authenticated", False):
+            try:
+                user_oid = ObjectId(str(request.user.id))
+            except Exception:
+                user_oid = None
+
+        pipeline = [
+            {"$match": {
+                "category_id": category["_id"],
+                "category_child_id": child_category["_id"],
+            }},
+            {"$sort": {"published_at": -1}},
+            {"$limit": limit},
+
+            # map category_name + category_slug
+            {"$lookup": {
+                "from": "categories",
+                "localField": "category_id",
+                "foreignField": "_id",
+                "as": "cat",
+            }},
+            {"$unwind": {"path": "$cat", "preserveNullAndEmptyArrays": True}},
+
+            # map child_name + child_slug
+            {"$lookup": {
+                "from": "category_child",
+                "localField": "category_child_id",
+                "foreignField": "_id",
+                "as": "child",
+            }},
+            {"$unwind": {"path": "$child", "preserveNullAndEmptyArrays": True}},
+        ]
+
+        # check bookmark
+        if user_oid:
+            pipeline += [
+                {"$lookup": {
+                    "from": "bookmarks",
+                    "let": {"aid": "$_id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$and": [
+                            {"$eq": ["$article_id", "$$aid"]},
+                            {"$eq": ["$user_id", user_oid]},
+                        ]}}},
+                        {"$limit": 1},
+                    ],
+                    "as": "bm",
+                }},
+                {"$addFields": {"is_bookmarked": {"$gt": [{"$size": "$bm"}, 0]}}},
+            ]
+        else:
+            pipeline += [{"$addFields": {"is_bookmarked": False}}]
+
+        pipeline += [
+            {"$project": {
+                "_id": 1,
+                "site": 1,
+                "title": 1,
+                "images": 1,
+                "content": 1,
+                "published_at": 1,
+
+                "category_id": 1,
+                "category_name": "$cat.name",
+                "category_slug": "$cat.slug",
+
+                "category_child_id": 1,
+                "category_child_name": "$child.name",
+                "category_child_slug": "$child.slug",
+
+                "is_bookmarked": 1,
+            }}
+        ]
+
+        docs = list(db["articles"].aggregate(pipeline))
+        return HttpResponse(json_util.dumps(docs), content_type="application/json")
+
 class BookmarkArticle(APIView):
     permission_classes = [IsAuthenticated, RoleRequired.any_of("user", "admin", "employee")]
     def post(self, request, article_id):
@@ -368,6 +622,7 @@ class CommentOfUser(APIView):
 
 class GetArticleById(APIView):
     permission_classes = [AllowAny]
+
     def get(self, request, article_id):
         db = get_db()
 
@@ -376,30 +631,70 @@ class GetArticleById(APIView):
         except Exception:
             return Response({"detail": "Invalid article_id"}, status=400)
 
-        article = db["articles"].find_one({"_id": article_oid})
+        article = db["articles"].find_one(
+            {"_id": article_oid},
+            {"keywords": 0, "entities": 0, "status": 0, "is_deleted": 0}
+        )
         if not article:
             return Response({"detail": "Article not found"}, status=404)
 
-        # 3) Lấy category cha
+        # --- Map category cha: name + slug ---
         category_name = None
-        if article.get("category_id"):
-            cat = db["categories"].find_one({"_id": article["category_id"]})
+        category_slug = None
+        cat_id = article.get("category_id")
+        if cat_id:
+            cat = db["categories"].find_one({"_id": cat_id}, {"name": 1, "slug": 1})
             if cat:
                 category_name = cat.get("name")
+                category_slug = cat.get("slug")
 
-        # 4) Lấy category con
+        # --- Map category con: name + slug (nếu có) ---
         category_child_name = None
-        if article.get("category_child_id"):
-            child = db["category_child"].find_one({"_id": article["category_child_id"]})
+        category_child_slug = None
+        child_id = article.get("category_child_id")
+        if child_id:
+            child = db["category_child"].find_one({"_id": child_id}, {"name": 1, "slug": 1})
             if child:
                 category_child_name = child.get("name")
+                category_child_slug = child.get("slug")
 
-        # 5) Thêm vào kết quả trả về
         article["category_name"] = category_name
+        article["category_slug"] = category_slug
         article["category_child_name"] = category_child_name
+        article["category_child_slug"] = category_child_slug
 
-        json_data = json_util.dumps(article)
-        return HttpResponse(json_data, content_type="application/json")
+        # --- Check bookmark theo user (nếu đăng nhập) ---
+        is_bookmarked = False
+        if getattr(request, "user", None) and getattr(request.user, "is_authenticated", False):
+            try:
+                user_oid = ObjectId(str(request.user.id))
+                bm = db["bookmarks"].find_one(
+                    {"user_id": user_oid, "article_id": article_oid},
+                    {"_id": 1}
+                )
+                is_bookmarked = bm is not None
+            except Exception:
+                is_bookmarked = False
+
+        article["is_bookmarked"] = is_bookmarked
+
+        # --- Lấy comments theo bài viết ---
+        # Lọc comment chưa bị xoá: is_deleted = false hoặc field không tồn tại
+        comment_filter = {
+            "article_id": article_oid,
+            "$or": [{"is_deleted": False}, {"is_deleted": {"$exists": False}}],
+        }
+
+        comments = list(
+            db["comments"]
+              .find(comment_filter, {"username": 1, "content": 1, "created_at": 1})
+              .sort("created_at", -1)
+        )
+
+        article["comments"] = comments
+        article["comment_count"] = len(comments)
+
+        return HttpResponse(json_util.dumps(article), content_type="application/json")
 
 class GetArticleExpectForArticleById(APIView):
     permission_classes = [AllowAny]
@@ -428,8 +723,8 @@ class GetArticleExpectForArticleById(APIView):
         related_cursor = (
             db["articles"]
             .find(query, {"title": 1, "content": 1, "images": 1})
-            .sort("published_at", -1)  # field ngày giờ, tuỳ bạn đang dùng tên gì
-            .limit(2)
+            .sort("published_at", -1)
+            .limit(3)
         )
 
         related_articles = list(related_cursor)
@@ -559,4 +854,127 @@ class FindArticleByCategoryChild(APIView):
         articles = list(db["articles"].find({"category_child_id": category_child["_id"]}).sort("created_at", -1))
         json_data = json_util.dumps(articles)
         return HttpResponse(json_data, content_type="application/json")
+
+class GetAllCategory(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        db = get_db()
+        categories = list(db["categories"].find({}))
+        if not categories:
+            return Response({"detail": "Category not found"}, status=404)
+
+        json_data = json_util.dumps(categories)
+        return HttpResponse(json_data, content_type="application/json")
+
+def top10_articles_this_month(db, user_id: str | None = None):
+    # Tháng hiện tại theo giờ VN
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    now = datetime.now(tz)
+
+    month_start_local = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if month_start_local.month == 12:
+        next_month_local = month_start_local.replace(year=month_start_local.year + 1, month=1)
+    else:
+        next_month_local = month_start_local.replace(month=month_start_local.month + 1)
+
+    month_start_utc = month_start_local.astimezone(timezone.utc)
+    next_month_utc = next_month_local.astimezone(timezone.utc)
+
+    # parse user ObjectId (nếu có)
+    user_oid = None
+    if user_id:
+        try:
+            user_oid = ObjectId(user_id)
+        except Exception:
+            user_oid = None
+
+    pipeline = [
+        {"$sort": {"views": -1}},
+
+        # join sang articles
+        {"$lookup": {
+            "from": "articles",
+            "localField": "_id",         # nếu popularity._id == articles._id
+            "foreignField": "_id",
+            "as": "article",
+        }},
+        {"$unwind": "$article"},
+
+        # lọc bài trong tháng theo published_at
+        {"$match": {
+            "article.published_at": {"$gte": month_start_utc, "$lt": next_month_utc}
+        }},
+
+        {"$limit": 10},
+
+        # join categories để lấy category_name
+        {"$lookup": {
+            "from": "categories",
+            "localField": "article.category_id",
+            "foreignField": "_id",
+            "as": "cat",
+        }},
+        {"$unwind": {"path": "$cat", "preserveNullAndEmptyArrays": True}},
+    ]
+
+    # nếu có user -> lookup bookmarks để check is_bookmarked
+    if user_oid:
+        pipeline += [
+            {"$lookup": {
+                "from": "bookmarks",   # nếu tên collection bạn là "bookmark" thì đổi lại
+                "let": {"aid": "$article._id"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$and": [
+                        {"$eq": ["$article_id", "$$aid"]},
+                        {"$eq": ["$user_id", user_oid]},
+                    ]}}},
+                    {"$limit": 1},
+                ],
+                "as": "bm",
+            }},
+            {"$addFields": {"is_bookmarked": {"$gt": [{"$size": "$bm"}, 0]}}},
+        ]
+    else:
+        pipeline += [
+            {"$addFields": {"is_bookmarked": False}}
+        ]
+
+    pipeline += [
+        {"$project": {
+            "_id": 0,
+            "views": 1,
+            "is_bookmarked": 1,
+            "article": {
+                "_id": "$article._id",
+                "images": "$article.images",     # nếu bạn dùng field "image" thì đổi "$article.image"
+                "title": "$article.title",
+                "published_at": "$article.published_at",
+                "category_name": "$cat.name",
+            }
+        }},
+    ]
+
+    return list(db["article_popularity"].aggregate(pipeline))
+
+
+class TopArticlesThisMonth(APIView):
+    permission_classes = [AllowAny]
+    # authentication_classes = []
+
+    def get(self, request):
+        db = get_db()
+        user_id = None
+        if getattr(request, "user", None) and request.user.is_authenticated:
+            user_id = str(request.user.id)
+
+        data = top10_articles_this_month(db, user_id=user_id)
+
+        return HttpResponse(
+            json_util.dumps(data),
+            content_type="application/json"
+        )
+
+
 
