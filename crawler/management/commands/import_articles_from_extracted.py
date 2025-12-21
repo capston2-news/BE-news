@@ -1,15 +1,21 @@
+# crawler/management/commands/import_articles_from_extracted.py
 # -*- coding: utf-8 -*-
+
+# ✅ load .env sớm
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from django.core.management.base import BaseCommand, CommandError
 from api.db import get_db
-from datetime import datetime, timezone
 from pymongo import ReturnDocument
 from urllib.parse import urlparse
 import re, unicodedata
 from crawler.utils.time_utils import now_vn
 
-def _now(): return datetime.now(timezone.utc)
 
-# ===== Category mapping linh hoạt theo rss_url + site =====
 SITE_SLUG_TO_NAME = {
     "thanhnien": {
         "thoi-su": "Thời sự",
@@ -25,7 +31,6 @@ SITE_SLUG_TO_NAME = {
         "the-thao": "Thể thao",
         "giai-tri": "Giải trí",
         "cong-nghe": "Công nghệ",
-        "xe": "Xe"
     },
     "vnexpress": {
         "thoi-su": "Thời sự",
@@ -39,7 +44,6 @@ SITE_SLUG_TO_NAME = {
         "doi-song": "Đời sống",
         "du-lich": "Du lịch",
         "khoa-hoc-cong-nghe": "Khoa học công nghệ",
-        "xe": "Xe"
     },
 }
 
@@ -85,28 +89,22 @@ def _is_same_section_as_parent(section: str, parent_name: str) -> bool:
     p = _strip_accents(parent_name)
     return s == p or s == p.replace(" ", "-")
 
-# ======= LOOKUP-ONLY cho category_child (không auto-insert) =======
 def _find_category_child_id_only(db, parent_id, section_name, normalize_fn):
-    """
-    Chỉ tra cứu category_child đã có theo (category_id, name) hoặc (category_id, slug).
-    Không tạo mới. Không tìm thấy -> None.
-    """
     if not section_name:
         return None
     name = section_name.strip()
     slug = normalize_fn(name)
 
-    # Ưu tiên name
     doc = db.category_child.find_one({"category_id": parent_id, "name": name}, {"_id": 1})
     if doc:
         return doc["_id"]
 
-    # Fallback slug
     doc = db.category_child.find_one({"category_id": parent_id, "slug": slug}, {"_id": 1})
     if doc:
         return doc["_id"]
 
     return None
+
 
 class Command(BaseCommand):
     help = "Import từ extracted_articles sang authors/categories/category_child/articles (lookup-only category_child) + copy images."
@@ -124,7 +122,7 @@ class Command(BaseCommand):
             raise CommandError("Cần --source")
 
         verbose = bool(opts.get("verbose"))
-        limit = int(opts.get("limit"))
+        limit = int(opts.get("limit") or 0)
         allow_update = bool(opts.get("update"))
 
         src = db.crawl_sources.find_one({"name_source": name_source})
@@ -136,7 +134,7 @@ class Command(BaseCommand):
         if verbose:
             self.stdout.write(f"Importing from extracted for source='{name_source}' site='{site}'")
 
-        # 1) parent category (động theo rss_url + site)
+        # 1) parent category
         parent_name = map_category_name_from_rss(rss_url, site)
         parent_doc = db.categories.find_one_and_update(
             {"name": parent_name},
@@ -145,10 +143,14 @@ class Command(BaseCommand):
         )
         parent_id = parent_doc["_id"]
 
-        # 2) cursor
-        q = {"source_id": src["_id"]}
+        # ✅ FIX QUAN TRỌNG: extracted_articles.source_id có thể lưu ObjectId hoặc string
+        sid_obj = src["_id"]
+        sid_str = str(src["_id"])
+        q = {"source_id": {"$in": [sid_obj, sid_str]}}
+
         cur = db.extracted_articles.find(q).sort("created_at", -1)
-        if limit and limit > 0: cur = cur.limit(limit)
+        if limit and limit > 0:
+            cur = cur.limit(limit)
 
         total = inserted = updated = skipped = 0
 
@@ -164,10 +166,11 @@ class Command(BaseCommand):
 
             if not title or not content or not external_url:
                 skipped += 1
-                if verbose: self.stdout.write(self.style.WARNING(f"[SKIP] thiếu title/content/url: {external_url}"))
+                if verbose:
+                    self.stdout.write(self.style.WARNING(f"[SKIP] thiếu title/content/url: {external_url}"))
                 continue
 
-            # author upsert (author có thể None)
+            # author upsert
             author_id = None
             if author_name:
                 a = db.authors.find_one_and_update(
@@ -177,11 +180,10 @@ class Command(BaseCommand):
                 )
                 author_id = a["_id"]
 
-            # ===== lookup-only category_child =====
+            # lookup-only category_child
             category_child_id = None
             if section and not _is_same_section_as_parent(section, parent_name):
                 category_child_id = _find_category_child_id_only(db, parent_id, section, _slugify)
-                # Không tìm thấy -> để None (KHÔNG tạo mới)
 
             # upsert article
             filter_doc = {"site": site, "external_url": external_url}
@@ -196,20 +198,24 @@ class Command(BaseCommand):
                 "images": images,
                 "updated_at": now_vn(),
             }
+
             update_doc = {"$setOnInsert": set_on_insert, "$set": set_doc} if allow_update \
                          else {"$setOnInsert": {**set_on_insert, **set_doc}}
 
             res = db.articles.update_one(filter_doc, update_doc, upsert=True)
             if res.matched_count == 0 and res.upserted_id is not None:
                 inserted += 1
-                if verbose: self.stdout.write(self.style.SUCCESS(f"[OK]   INSERT | {title} | child={section or '-'}"))
+                if verbose:
+                    self.stdout.write(self.style.SUCCESS(f"[OK]   INSERT | {title} | section={section or '-'}"))
             else:
                 if allow_update and res.modified_count > 0:
                     updated += 1
-                    if verbose: self.stdout.write(self.style.SUCCESS(f"[OK]   UPDATE | {title} | child={section or '-'}"))
+                    if verbose:
+                        self.stdout.write(self.style.SUCCESS(f"[OK]   UPDATE | {title} | section={section or '-'}"))
                 else:
                     skipped += 1
-                    if verbose: self.stdout.write(self.style.WARNING(f"[SKIP] EXIST | {title}"))
+                    if verbose:
+                        self.stdout.write(self.style.WARNING(f"[SKIP] EXIST | {title}"))
 
         self.stdout.write(self.style.SUCCESS(
             f"Import done: total={total} inserted={inserted} updated={updated} skipped={skipped}"

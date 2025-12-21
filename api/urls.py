@@ -1,11 +1,16 @@
 # api/urls.py
 from django.urls import path
+
+from .admin_bookmark import GetAllBookmarksOfUsers
+from .admin_comments import AdminListComments, AdminDeleteComment, AdminPendingCommentsCount, AdminRestoreComment
+from .admin_dashboard import AdminDashboardKPIView, AdminViewsSeriesView, AdminCommentsSeriesView, AdminTopArticlesView, AdminViewsByCategoryView, AdminViewsBySiteView
 from .auth_views import RegisterMongo, LoginMongo, RefreshMongo, LogoutMongo, MeMongo
 from .api_views import PublicApi, ApiCreate, ApiDelete
-from .admin_users import AdminCreateUser, AdminSetRole
+from .admin_users import AdminCreateUser, AdminSetRole,  AdminUpdateUser
 from . import views
+from .admin_authors import AdminAuthors, AdminAuthorDetail, AdminAuthorRestore
 
-app_name = "api"  # để dùng namespace: 'api:login', ...
+app_name = "api"
 
 urlpatterns = [
     path("auth/register/", RegisterMongo.as_view(), name="register"),
@@ -20,7 +25,8 @@ urlpatterns = [
 
     path("users/",               AdminCreateUser.as_view(), name="admin-users-create"),     # POST (admin) -> luôn employee
     path("users/<str:oid>/role/",AdminSetRole.as_view(), name="admin-users-setrole"), 
-       
+
+    path("articles/history/viewed/", views.UserViewedHistory.as_view()),
     path("articles/all/", views.PublicGetAllArticles.as_view(), name="get-all-articles" ),
     path("articles/category/<str:slug>/", views.PublicGetArticlesByCategory.as_view(), name="get-articles-by-category" ),
     path("category/all/child/<str:category_slug>/", views.GetAllCategoryChildOfCategory.as_view(), name="get-all-category-child-of-category"),
@@ -41,4 +47,42 @@ urlpatterns = [
     path("categories/all/", views.GetAllCategory.as_view(), name="get_all_category"),
 
     path("articles/month/", views.TopArticlesThisMonth.as_view(), name ="top_10_articles_this_month"),
+
+    path("article/bookmark/", views.GatBookmarkOfUser.as_view(), name = "get_article_bookmark"),
+
+    path("article/search/", views.SearchArticleByTitle.as_view(), name = "search_article"),
+
+    path("<str:comment_id>/lookup-article/", views.CommentLookupArticleView.as_view()),
+
+    path("admin/comments/<str:comment_id>/checked/", views.AdminApproveComment.as_view()),
+
+
+
+
+    path("categories/<slug:category_slug>/children/", views.AdminCreateCategoryChild.as_view()),
+    path("categories/<slug:category_slug>/children/<str:child_id>/", views.AdminUpdateCategoryChild.as_view()),  # PATCH
+    path("categories/<slug:category_slug>/children/<str:child_id>/delete/", views.AdminDeleteCategoryChild.as_view()),
+    path("admin/comments/", AdminListComments.as_view()),
+    path("admin/comments/<str:comment_id>/delete/", AdminDeleteComment.as_view()),
+    path("admin/comments/pending-count/", AdminPendingCommentsCount.as_view()),
+    path("admin/comments/<str:comment_id>/restore/", AdminRestoreComment.as_view()),
+
+    path("admin/authors/", AdminAuthors.as_view()),
+    path("admin/authors/<str:id>/", AdminAuthorDetail.as_view()),
+    path("admin/authors/<str:id>/restore/", AdminAuthorRestore.as_view()),  # ✅
+
+    path("dashboard/kpis", AdminDashboardKPIView.as_view()),
+    path("dashboard/views-series", AdminViewsSeriesView.as_view()),
+    path("dashboard/comments-series", AdminCommentsSeriesView.as_view()),
+    path("dashboard/top-articles", AdminTopArticlesView.as_view()),
+    path("dashboard/views-by-category", AdminViewsByCategoryView.as_view()),
+    path("dashboard/views-by-site", AdminViewsBySiteView.as_view()),
+
+    path("create/categories/", views.AdminCreateCategory.as_view()),
+    path("categories/<str:category_id>/", views.AdminUpdateCategory.as_view()),          # PATCH
+    path("categories/<str:category_id>/delete/", views.AdminDeleteCategory.as_view()),  # DELETE
+
+    path("getall/users/",views.GetAllUsers.as_view(), name="getall-user"),
+    path("users/<str:user_id>/", AdminUpdateUser.as_view(), name="admin-users-detail"),
+    path("admin/users/<str:user_id>/bookmarks/", GetAllBookmarksOfUsers.as_view()),
 ]

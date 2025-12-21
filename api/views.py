@@ -3,7 +3,7 @@ from rest_framework import serializers, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from .db import get_db
-from datetime import datetime, timezone, time
+from datetime import datetime, timezone, time, date
 from zoneinfo import ZoneInfo
 from .permissions import AllowAny, IsAuthenticated, RoleRequired
 from bson import json_util, ObjectId
@@ -15,6 +15,12 @@ from django.conf import settings
 import mimetypes
 from google.cloud import texttospeech
 
+from api.utils.serialize import ser_doc
+
+from notifications.services import create_notification_comment_approved
+from notifications.realtime import publish
+from notifications.views import _ser
+
 VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 UTC_TZ = ZoneInfo("UTC")
 
@@ -24,6 +30,197 @@ def _parse_date_yyyy_mm_dd(s: str):
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         return None
+
+class UserViewedHistory(APIView):
+    permission_classes = [IsAuthenticated, RoleRequired.any_of("user", "admin", "employee")]
+
+    def get(self, request):
+        db = get_db()
+
+        # ----- limit -----
+        try:
+            limit = int(request.GET.get("limit", "50"))
+        except Exception:
+            limit = 50
+        limit = max(1, min(limit, 200))
+
+        # all=1 -> trả về tất cả lượt xem; mặc định unique theo bài (lấy lượt xem mới nhất)
+        all_events = str(request.GET.get("all", "")).lower() in ("1", "true", "yes")
+
+        # ----- user id (có thể lưu dạng string hoặc ObjectId trong user_activity) -----
+        raw_uid = getattr(request.user, "id", None) or getattr(request.user, "_id", None)
+        if not raw_uid:
+            return JsonResponse({"detail": "Unauthorized"}, status=401)
+
+        user_id_str = str(raw_uid)
+        user_id_oid = ObjectId(user_id_str) if ObjectId.is_valid(user_id_str) else None
+
+        # match user + action=view
+        if user_id_oid:
+            match_user = {"$or": [{"user_id": user_id_oid}, {"user_id": user_id_str}]}
+        else:
+            match_user = {"user_id": user_id_str}
+
+        pipeline = [
+            {"$match": {**match_user, "action": "view"}},
+
+            # chuẩn hoá article_id -> ObjectId để join articles ổn định
+            {
+                "$addFields": {
+                    "_article_oid": {
+                        "$cond": [
+                            {"$eq": [{"$type": "$article_id"}, "objectId"]},
+                            "$article_id",
+                            {"$convert": {"input": "$article_id", "to": "objectId", "onError": None, "onNull": None}},
+                        ]
+                    }
+                }
+            },
+            {"$match": {"_article_oid": {"$ne": None}}},
+            {"$sort": {"ts": -1}},
+        ]
+
+        # unique theo bài: lấy record mới nhất cho mỗi article
+        if not all_events:
+            pipeline += [
+                {
+                    "$group": {
+                        "_id": "$_article_oid",
+                        "article_id": {"$first": "$_article_oid"},
+                        "viewed_at": {"$first": "$ts"},
+                        "site": {"$first": "$site"},
+                        "action": {"$first": "$action"},
+
+                        # giữ lại thông tin category snapshot trong activity (nếu có)
+                        "ua_category_id": {"$first": "$category_id"},
+                        "ua_category_child_id": {"$first": "$category_child_id"},
+                        "ua_category_name": {"$first": "$category_name"},
+                        "ua_category_child_name": {"$first": "$category_child_name"},
+                    }
+                },
+                {"$sort": {"viewed_at": -1}},
+            ]
+        else:
+            # all events: giữ từng event
+            pipeline += [
+                {
+                    "$addFields": {
+                        "article_id": "$_article_oid",
+                        "viewed_at": "$ts",
+                        "ua_category_id": "$category_id",
+                        "ua_category_child_id": "$category_child_id",
+                        "ua_category_name": "$category_name",
+                        "ua_category_child_name": "$category_child_name",
+                    }
+                }
+            ]
+
+        pipeline += [
+            {"$limit": limit},
+
+            # join articles
+            {
+                "$lookup": {
+                    "from": "articles",
+                    "localField": "article_id",
+                    "foreignField": "_id",
+                    "as": "art",
+                }
+            },
+            {"$unwind": {"path": "$art", "preserveNullAndEmptyArrays": True}},
+
+            # chọn category_id/category_child_id ưu tiên từ article, fallback sang snapshot trong activity
+            {
+                "$addFields": {
+                    "_cat_oid": {"$ifNull": ["$art.category_id", "$ua_category_id"]},
+                    "_child_oid": {"$ifNull": ["$art.category_child_id", "$ua_category_child_id"]},
+                }
+            },
+
+            # map category
+            {
+                "$lookup": {
+                    "from": "categories",
+                    "localField": "_cat_oid",
+                    "foreignField": "_id",
+                    "as": "cat",
+                }
+            },
+            {"$unwind": {"path": "$cat", "preserveNullAndEmptyArrays": True}},
+
+            # map category_child
+            {
+                "$lookup": {
+                    "from": "category_child",
+                    "localField": "_child_oid",
+                    "foreignField": "_id",
+                    "as": "child",
+                }
+            },
+            {"$unwind": {"path": "$child", "preserveNullAndEmptyArrays": True}},
+        ]
+
+        # check bookmark (bookmarks thường lưu user_id là ObjectId)
+        if user_id_oid:
+            pipeline += [
+                {
+                    "$lookup": {
+                        "from": "bookmarks",
+                        "let": {"aid": "$article_id"},
+                        "pipeline": [
+                            {
+                                "$match": {
+                                    "$expr": {
+                                        "$and": [
+                                            {"$eq": ["$article_id", "$$aid"]},
+                                            {"$eq": ["$user_id", user_id_oid]},
+                                        ]
+                                    }
+                                }
+                            },
+                            {"$limit": 1},
+                        ],
+                        "as": "bm",
+                    }
+                },
+                {"$addFields": {"is_bookmarked": {"$gt": [{"$size": "$bm"}, 0]}}},
+            ]
+        else:
+            pipeline += [{"$addFields": {"is_bookmarked": False}}]
+
+        # output
+        pipeline += [
+            {
+                "$project": {
+                    "_id": 0,
+                    "article_id": 1,
+                    "action": 1,
+                    "site": 1,
+                    "viewed_at": 1,
+
+                    # article fields
+                    "title": "$art.title",
+                    "images": "$art.images",
+                    "content": "$art.content",
+                    "published_at": "$art.published_at",
+
+                    # category fields (ưu tiên lookup, fallback snapshot activity)
+                    "category_id": "$_cat_oid",
+                    "category_name": {"$ifNull": ["$cat.name", "$ua_category_name"]},
+                    "category_slug": "$cat.slug",
+
+                    "category_child_id": "$_child_oid",
+                    "category_child_name": {"$ifNull": ["$child.name", "$ua_category_child_name"]},
+                    "category_child_slug": "$child.slug",
+
+                    "is_bookmarked": 1,
+                }
+            }
+        ]
+
+        docs = list(db["user_activity"].aggregate(pipeline))
+        return HttpResponse(json_util.dumps(docs), content_type="application/json")
+
 
 class PublicGetAllArticles(APIView):
     permission_classes = [AllowAny]
@@ -230,6 +427,8 @@ class PublicGetArticlesByCategory(APIView):
                 "images": 1,
                 "content": 1,
                 "published_at": 1,
+                "external_url": 1,
+                "status": 1,
 
                 "category_id": 1,
                 "category_name": "$cat.name",
@@ -348,6 +547,8 @@ class PublicGetArticlesByCategoryChild(APIView):
                 "images": 1,
                 "content": 1,
                 "published_at": 1,
+                "external_url": 1,
+                "status": 1,
 
                 "category_id": 1,
                 "category_name": "$cat.name",
@@ -534,7 +735,7 @@ class CommentOfUser(APIView):
         except Exception:
             return Response({"detail": "Invalid user_id"}, status=400)
 
-        comment = list(db["comments"].find({"article_id": article_oid}, {"username": 1, "content": 1, "created_at": 1, "_id": 0}).sort("created_at", -1))
+        comment = list(db["comments"].find({"article_id": article_oid}, {"username": 1, "content": 1, "created_at": 1, "_id": 0, "is_checked": 1}).sort("created_at", -1))
 
         json_data = json_util.dumps(comment)
         return HttpResponse(json_data, content_type="application/json")
@@ -605,6 +806,7 @@ class CommentOfUser(APIView):
                 "content": content,
                 "created_at": now_vn,
                 "is_deleted": False,
+                "is_checked": False
             }
 
             ins = db["comments"].insert_one(comment_doc)
@@ -961,7 +1163,6 @@ def top10_articles_this_month(db, user_id: str | None = None):
 
 class TopArticlesThisMonth(APIView):
     permission_classes = [AllowAny]
-    # authentication_classes = []
 
     def get(self, request):
         db = get_db()
@@ -975,6 +1176,784 @@ class TopArticlesThisMonth(APIView):
             json_util.dumps(data),
             content_type="application/json"
         )
+
+class GatBookmarkOfUser(APIView):
+    permission_classes = [IsAuthenticated, RoleRequired.any_of("user", "admin", "employee")]
+
+    def get(self, request):
+        db = get_db()
+
+        try:
+            user_oid = ObjectId(str(request.user.id))
+        except Exception:
+            return Response({"detail": "Invalid user_id"}, status=400)
+
+        pipeline = [
+            {"$match": {"user_id": user_oid}},
+            {"$sort": {"created_at": -1}},
+
+            {"$lookup": {
+                "from": "articles",
+                "localField": "article_id",
+                "foreignField": "_id",
+                "as": "article",
+            }},
+            {"$unwind": "$article"},
+
+            {"$lookup": {
+                "from": "categories",
+                "localField": "article.category_id",
+                "foreignField": "_id",
+                "as": "cat",
+            }},
+            {"$unwind": {"path": "$cat", "preserveNullAndEmptyArrays": True}},
+
+            {"$lookup": {
+                "from": "category_child",
+                "localField": "article.category_child_id",
+                "foreignField": "_id",
+                "as": "child",
+            }},
+            {"$unwind": {"path": "$child", "preserveNullAndEmptyArrays": True}},
+
+            # ✅ chỉ trả article + is_bookmarked
+            {"$project": {
+                "_id": "$article._id",
+                "site": "$article.site",
+                "title": "$article.title",
+                "images": "$article.images",
+                "content": "$article.content",
+                "published_at": "$article.published_at",
+
+                "category_id": "$article.category_id",
+                "category_name": "$cat.name",
+                "category_slug": "$cat.slug",
+
+                "category_child_id": "$article.category_child_id",
+                "category_child_name": "$child.name",
+                "category_child_slug": "$child.slug",
+
+                "is_bookmarked": {"$literal": True},
+            }},
+        ]
+
+        data = list(db["bookmarks"].aggregate(pipeline))
+        return HttpResponse(json_util.dumps(data), content_type="application/json")
+
+class SearchArticleByTitle(APIView):
+    permission_classes = [AllowAny]
+    def get(self, request):
+        db = get_db()
+
+        key = (request.query_params.get("key") or "").strip()
+        if not key:
+            return Response({"detail": "Search not found"}, status=404)
+
+        # limit (optional)
+        try:
+            limit = int(request.query_params.get("limit", "100"))
+        except ValueError:
+            limit = 100
+        if limit <= 0:
+            limit = 100
+        if limit > 400:
+            limit = 400
+
+        mongo_filter = {
+            "title": {"$regex": re.compile(re.escape(key), re.IGNORECASE)}
+        }
+
+        # user để check bookmark (bookmarks.user_id là ObjectId)
+        user_oid = None
+        if getattr(request, "user", None) and getattr(request.user, "is_authenticated", False):
+            try:
+                user_oid = ObjectId(str(request.user.id))
+            except Exception:
+                user_oid = None
+
+        pipeline = [
+            {"$match": mongo_filter},
+            {"$sort": {"published_at": -1}},
+            {"$limit": limit},
+
+            # map category (cha)
+            {"$lookup": {
+                "from": "categories",
+                "localField": "category_id",
+                "foreignField": "_id",
+                "as": "cat",
+            }},
+            {"$unwind": {"path": "$cat", "preserveNullAndEmptyArrays": True}},
+
+            # map category_child (con)
+            {"$lookup": {
+                "from": "category_child",
+                "localField": "category_child_id",
+                "foreignField": "_id",
+                "as": "child",
+            }},
+            {"$unwind": {"path": "$child", "preserveNullAndEmptyArrays": True}},
+        ]
+
+        # check bookmark nếu có user đăng nhập
+        if user_oid:
+            pipeline += [
+                {"$lookup": {
+                    "from": "bookmarks",
+                    "let": {"aid": "$_id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$and": [
+                            {"$eq": ["$article_id", "$$aid"]},
+                            {"$eq": ["$user_id", user_oid]},
+                        ]}}},
+                        {"$limit": 1},
+                    ],
+                    "as": "bm",
+                }},
+                {"$addFields": {"is_bookmarked": {"$gt": [{"$size": "$bm"}, 0]}}},
+            ]
+        else:
+            pipeline += [{"$addFields": {"is_bookmarked": False}}]
+
+        pipeline += [
+            {"$project": {
+                "_id": 1,
+                "site": 1,
+                "title": 1,
+                "images": 1,
+                "content": 1,
+                "published_at": 1,
+
+                "category_id": 1,
+                "category_name": "$cat.name",
+                "category_slug": "$cat.slug",
+
+                "category_child_id": 1,
+                "category_child_name": "$child.name",
+                "category_child_slug": "$child.slug",
+
+                "is_bookmarked": 1,
+            }}
+        ]
+
+        docs = list(db["articles"].aggregate(pipeline))
+        if not docs:
+            return Response({"detail": "Article not found"}, status=404)
+
+        return HttpResponse(json_util.dumps(docs), content_type="application/json")
+
+
+#comment
+def _to_oid(v):
+    if not v:
+        return None
+    if isinstance(v, ObjectId):
+        return v
+    if isinstance(v, dict) and "$oid" in v:
+        try:
+            return ObjectId(v["$oid"])
+        except Exception:
+            return None
+    s = str(v).strip()
+    return ObjectId(s) if ObjectId.is_valid(s) else None
+
+
+def _get_username(request):
+    u = getattr(request, "user", None)
+    if not u or not getattr(u, "is_authenticated", False):
+        return None
+    if isinstance(u, dict):
+        return u.get("username") or u.get("name") or u.get("email")
+    return getattr(u, "username", None) or getattr(u, "name", None) or getattr(u, "email", None)
+
+
+class CommentLookupArticleView(APIView):
+    """
+    GET /api/<comment_id>/lookup-article/
+    Trả: { comment_id, article_id }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, comment_id):
+        oid = _to_oid(comment_id)
+        if not oid:
+            return Response({"detail": "Invalid comment_id"}, status=400)
+
+        db = get_db()
+        username = _get_username(request)
+
+        # ✅ chỉ owner mới lookup (comment lưu username string)
+        q = {"_id": oid}
+        if username:
+            q["username"] = username
+
+        doc = db.comments.find_one(q, {"_id": 1, "article_id": 1})
+        if not doc:
+            return Response({"detail": "Comment not found"}, status=404)
+
+        if not doc.get("article_id"):
+            return Response({"detail": "Missing article_id"}, status=500)
+
+        return Response(
+            {"comment_id": str(doc["_id"]), "article_id": str(doc["article_id"])},
+            status=200,
+        )
+
+def to_oid(v):
+    try:
+        return ObjectId(str(v))
+    except Exception:
+        return None
+
+
+def ser(doc):
+    if not doc:
+        return None
+    out = dict(doc)
+
+    if isinstance(out.get("_id"), ObjectId):
+        out["_id"] = str(out["_id"])
+    if isinstance(out.get("article_id"), ObjectId):
+        out["article_id"] = str(out["article_id"])
+
+    for k in ("created_at", "approved_at", "deleted_at"):
+        dt = out.get(k)
+        if isinstance(dt, datetime):
+            out[k] = dt.isoformat()
+
+    return out
+
+
+def ensure_indexes(comments):
+    comments.create_index([("article_id", 1), ("created_at", -1)], name="ix_comments_article_time")
+    comments.create_index([("is_deleted", 1), ("is_checked", 1)], name="ix_comments_status")
+    comments.create_index([("username", 1)], name="ix_comments_username")
+
+
+
+class AdminApproveComment(APIView):
+    permission_classes = [IsAuthenticated, RoleRequired.any_of("admin", "employee")]
+
+    def patch(self, request, comment_id: str):
+        oid = to_oid(comment_id)
+        if not oid:
+            return Response({"detail": "Invalid comment_id"}, status=400)
+
+        db = get_db()
+        comments = db["comments"]
+        ensure_indexes(comments)
+
+        cur = comments.find_one(
+            {"_id": oid},
+            {"_id": 1, "is_deleted": 1, "is_checked": 1, "username": 1}
+        )
+        if not cur:
+            return Response({"detail": "Comment not found"}, status=404)
+
+        if cur.get("is_deleted") is True:
+            return Response({"detail": "Comment is deleted"}, status=400)
+
+        if cur.get("is_checked") is True:
+            out = comments.find_one({"_id": oid})
+            return Response(ser_doc(out), status=200)
+
+        now = datetime.now(timezone.utc)
+        comments.update_one(
+            {"_id": oid},
+            {"$set": {"is_checked": True, "approved_at": now, "is_deleted": False}},
+        )
+
+        # tạo notification theo username (nếu có)
+        username = cur.get("username")
+        if username:
+            try:
+                udoc = db["users"].find_one({"username": username}, {"_id": 1})
+                if udoc and udoc.get("_id"):
+                    create_notification_comment_approved(
+                        user_id=udoc["_id"],   # lưu DB: ObjectId ok
+                        comment_id=oid,        # lưu DB: ObjectId ok
+                        message="Bình luận của bạn đã được duyệt ✅",
+                    )
+            except Exception as e:
+                print("[AdminApproveComment] create notification error:", repr(e))
+
+        out = comments.find_one({"_id": oid})
+        return Response(ser_doc(out), status=200)
+
+
+
+
+
+
+def to_json_user(u: dict) -> dict:
+    # convert ObjectId + datetime -> string
+    u["_id"] = str(u.get("_id")) if u.get("_id") else None
+
+    for k in ["created_at", "updated_at"]:
+        v = u.get(k)
+        if isinstance(v, datetime):
+            u[k] = v.isoformat()
+    return u
+
+
+class GetAllUsers(APIView):
+    permission_classes = [AllowAny]  # ✅ khuyến nghị (tránh lộ data)
+
+    def get(self, request):
+        db = get_db()
+
+        # query params
+        q = (request.GET.get("q") or "").strip()
+        role = (request.GET.get("role") or "").strip()
+        is_active = request.GET.get("is_active")  # "true"/"false"
+        is_deleted = request.GET.get("is_deleted")  # "true"/"false"
+
+        try:
+            page = int(request.GET.get("page", "1"))
+        except ValueError:
+            page = 1
+        if page < 1:
+            page = 1
+
+        try:
+            page_size = int(request.GET.get("page_size", "20"))
+        except ValueError:
+            page_size = 20
+        page_size = max(1, min(page_size, 200))
+
+        skip = (page - 1) * page_size
+
+        # build filter
+        filt = {}
+        if q:
+            filt["$or"] = [
+                {"username": {"$regex": q, "$options": "i"}},
+                {"email": {"$regex": q, "$options": "i"}},
+                {"fullname": {"$regex": q, "$options": "i"}},
+            ]
+        if role:
+            filt["role"] = role
+
+        if is_active in ("true", "false"):
+            filt["is_active"] = (is_active == "true")
+
+        if is_deleted in ("true", "false"):
+            filt["is_deleted"] = (is_deleted == "true")
+
+        # query
+        total = db["users"].count_documents(filt)
+
+        cursor = (
+            db["users"]
+            .find(filt, {"password": 0})  # ✅ không trả password hash
+            .sort("created_at", -1)
+            .skip(skip)
+            .limit(page_size)
+        )
+
+        users = [to_json_user(u) for u in cursor]
+
+        return Response({
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "results": users,
+        })
+
+
+def to_oid(v):
+    try:
+        return ObjectId(str(v))
+    except Exception:
+        return None
+
+def ser(doc):
+    """Serialize mongo document -> json-safe"""
+    if not doc:
+        return None
+    out = dict(doc)
+    if "_id" in out:
+        out["_id"] = str(out["_id"])
+    if "category_id" in out and isinstance(out["category_id"], ObjectId):
+        out["category_id"] = str(out["category_id"])
+    return out
+
+_slug_re = re.compile(r"[^a-z0-9-]+")
+
+def clean_slug(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("đ", "d")
+    s = s.replace(" ", "-")
+    s = _slug_re.sub("", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s
+
+class AdminCreateCategorySerializer(serializers.Serializer):
+    name = serializers.CharField(required=True, allow_blank=False, max_length=200)
+    slug = serializers.CharField(required=False, allow_blank=True, max_length=200)
+
+class AdminUpdateCategorySerializer(serializers.Serializer):
+    name = serializers.CharField(required=False, allow_blank=False, max_length=200)
+    slug = serializers.CharField(required=False, allow_blank=True, max_length=200)
+    is_deleted = serializers.BooleanField(required=False)
+
+class AdminCreateCategoryChildSerializer(serializers.Serializer):
+    name = serializers.CharField(required=True, allow_blank=False, max_length=200)
+    slug = serializers.CharField(required=False, allow_blank=True, max_length=200)
+
+class AdminUpdateCategoryChildSerializer(serializers.Serializer):
+    name = serializers.CharField(required=False, allow_blank=False, max_length=200)
+    slug = serializers.CharField(required=False, allow_blank=True, max_length=200)
+    is_deleted = serializers.BooleanField(required=False)
+# =========================
+# ADMIN: CATEGORY
+# =========================
+class AdminCreateCategory(APIView):
+    permission_classes = [AllowAny]
+
+    def _ensure_indexes(self, categories):
+        categories.create_index(
+            "slug",
+            unique=True,
+            partialFilterExpression={"is_deleted": False},
+            name="ux_categories_slug_active",
+        )
+
+    def post(self, request):
+        s = AdminCreateCategorySerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        db = get_db()
+        categories = db["categories"]
+        self._ensure_indexes(categories)
+
+        name = (d.get("name") or "").strip()
+        slug = clean_slug(d.get("slug") or name)
+
+        if not name:
+            return Response({"detail": "name is required"}, status=400)
+        if not slug:
+            return Response({"detail": "slug is required"}, status=400)
+
+        if categories.find_one({"slug": slug, "is_deleted": False}, {"_id": 1}):
+            return Response({"detail": "Slug exists"}, status=400)
+
+        doc = {
+            "name": name,
+            "slug": slug,
+            "is_deleted": False,
+        }
+        r = categories.insert_one(doc)
+        out = categories.find_one({"_id": r.inserted_id})
+        return Response(ser(out), status=201)
+
+
+class AdminUpdateCategory(APIView):
+    permission_classes = [AllowAny]
+
+    def _ensure_indexes(self, categories):
+        categories.create_index(
+            "slug",
+            unique=True,
+            partialFilterExpression={"is_deleted": False},
+            name="ux_categories_slug_active",
+        )
+
+    def patch(self, request, category_id):
+        return self._update(request, category_id)
+
+    def _update(self, request, category_id):
+        oid = to_oid(category_id)
+        if not oid:
+            return Response({"detail": "Invalid category_id"}, status=400)
+
+        s = AdminUpdateCategorySerializer(data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        db = get_db()
+        categories = db["categories"]
+        self._ensure_indexes(categories)
+
+        # ✅ cho phép update cả record deleted để restore
+        cur = categories.find_one({"_id": oid})
+        if not cur:
+            return Response({"detail": "Category not found"}, status=404)
+
+        # ✅ nếu đang deleted mà không gửi is_deleted để restore -> chặn update
+        if cur.get("is_deleted") is True and "is_deleted" not in d:
+            return Response(
+                {"detail": "Category is deleted. Set is_deleted=false to restore first."},
+                status=400,
+            )
+
+        set_doc = {}
+
+        if "name" in d:
+            set_doc["name"] = (d["name"] or "").strip()
+            if not set_doc["name"]:
+                return Response({"detail": "name cannot be blank"}, status=400)
+
+        if "slug" in d:
+            new_slug = clean_slug(d.get("slug") or "")
+            if not new_slug:
+                return Response({"detail": "slug cannot be blank"}, status=400)
+            # unique check (exclude current)
+            if categories.find_one(
+                {"_id": {"$ne": oid}, "slug": new_slug, "is_deleted": False},
+                {"_id": 1},
+            ):
+                return Response({"detail": "Slug exists"}, status=400)
+            set_doc["slug"] = new_slug
+
+        # soft delete / restore (KHÔNG date fields)
+        if "is_deleted" in d:
+            set_doc["is_deleted"] = bool(d["is_deleted"])
+
+        if not set_doc:
+            return Response({"detail": "No fields to update"}, status=400)
+
+        categories.update_one({"_id": oid}, {"$set": set_doc})
+        out = categories.find_one({"_id": oid})
+        return Response(ser(out), status=200)
+
+
+class AdminDeleteCategory(APIView):
+    permission_classes = [AllowAny]
+
+    def delete(self, request, category_id):
+        oid = to_oid(category_id)
+        if not oid:
+            return Response({"detail": "Invalid category_id"}, status=400)
+
+        db = get_db()
+        categories = db["categories"]
+        childs = db["category_child"]
+        cur = categories.find_one({"_id": oid, "is_deleted": False}, {"_id": 1})
+        if not cur:
+            return Response({"detail": "Category not found"}, status=404)
+
+        # soft delete category (không date)
+        categories.update_one({"_id": oid}, {"$set": {"is_deleted": True}})
+
+        # tuỳ bạn: xoá mềm luôn children
+        childs.update_many({"category_id": oid, "is_deleted": False}, {"$set": {"is_deleted": True}})
+
+        return Response({"detail": "deleted"}, status=200)
+
+
+# =========================
+# ADMIN: CATEGORY CHILD
+# theo category_slug
+# =========================
+class AdminCreateCategoryChild(APIView):
+    permission_classes = [AllowAny]  # đổi sang IsAuthenticated/RoleRequired nếu cần
+
+    def _ensure_indexes(self, childs):
+        childs.create_index(
+            [("category_id", 1), ("slug", 1)],
+            unique=True,
+            partialFilterExpression={"is_deleted": False},
+            name="ux_child_cat_slug_active",
+        )
+
+    def post(self, request, category_slug):
+        s = AdminCreateCategoryChildSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        db = get_db()
+        categories = db["categories"]
+        childs = db["category_child"]
+        self._ensure_indexes(childs)
+
+        cat = categories.find_one({"slug": category_slug, "is_deleted": False}, {"_id": 1, "slug": 1})
+        if not cat:
+            return Response({"detail": "Category not found"}, status=404)
+
+        name = (d.get("name") or "").strip()
+        if not name:
+            return Response({"detail": "name cannot be blank"}, status=400)
+
+        slug = clean_slug(d.get("slug") or "")
+        if not slug:
+            return Response({"detail": "slug cannot be blank"}, status=400)
+
+        # check unique slug within category (active)
+        # ✅ support both ObjectId/string in stored data
+        if childs.find_one(
+            {
+                "$or": [{"category_id": cat["_id"]}, {"category_id": str(cat["_id"])}],
+                "slug": slug,
+                "is_deleted": False,
+            },
+            {"_id": 1},
+        ):
+            return Response({"detail": "Child slug exists in this category"}, status=400)
+
+        doc = {
+            "category_id": cat["_id"],   # ✅ always store ObjectId
+            "name": name,
+            "slug": slug,
+            "is_deleted": False,
+        }
+
+        childs.insert_one(doc)
+        out = childs.find_one({"slug": slug, "$or": [{"category_id": cat["_id"]}, {"category_id": str(cat["_id"])}]})
+        return Response(ser(out), status=201)
+
+
+
+class AdminUpdateCategoryChild(APIView):
+    permission_classes = [AllowAny]  # đổi sang IsAuthenticated/RoleRequired nếu cần
+    # permission_classes = [IsAuthenticated, RoleRequired.any_of("admin")]
+
+    def _ensure_indexes(self, childs):
+        childs.create_index(
+            [("category_id", 1), ("slug", 1)],
+            unique=True,
+partialFilterExpression={"is_deleted": False},
+            name="ux_child_cat_slug_active",
+        )
+
+    def patch(self, request, category_slug, child_id):
+        return self._update(request, category_slug, child_id)
+
+    def _update(self, request, category_slug, child_id):
+        oid = to_oid(child_id)
+        if not oid:
+            return Response({"detail": "Invalid child_id"}, status=400)
+
+        s = AdminUpdateCategoryChildSerializer(data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+
+        db = get_db()
+        categories = db["categories"]
+        childs = db["category_child"]
+        self._ensure_indexes(childs)
+
+        cat = categories.find_one({"slug": category_slug, "is_deleted": False}, {"_id": 1})
+        if not cat:
+            return Response({"detail": "Category not found"}, status=404)
+
+        # ✅ support both ObjectId/string stored category_id
+        only = childs.find_one({"_id": oid}, {"_id": 1, "category_id": 1, "is_deleted": 1, "slug": 1, "name": 1})
+        if not only:
+            return Response({"detail": "child_id not found in category_child"}, status=404)
+
+        # 2) check category match
+        child_cat = only.get("category_id")
+        ok = (child_cat == cat["_id"]) or (str(child_cat) == str(cat["_id"]))
+        if not ok:
+            return Response(
+                {
+                    "detail": "Child exists but does NOT belong to this category_slug",
+                    "child_id": str(only["_id"]),
+                    "child_category_id": str(child_cat),
+                    "expected_category_id": str(cat["_id"]),
+                    "category_slug": category_slug,
+                },
+                status=404,
+            )
+
+        # 3) nếu ok thì cur = only (hoặc query đầy đủ như bạn muốn)
+        cur = only
+
+        # ✅ if deleted and not restoring => block update
+        if cur.get("is_deleted") is True and "is_deleted" not in d:
+            return Response(
+                {"detail": "Category child is deleted. Set is_deleted=false to restore first."},
+                status=400,
+            )
+
+        set_doc = {}
+
+        if "name" in d:
+            name = (d.get("name") or "").strip()
+            if not name:
+                return Response({"detail": "name cannot be blank"}, status=400)
+            set_doc["name"] = name
+
+        if "slug" in d:
+            new_slug = clean_slug(d.get("slug") or "")
+            if not new_slug:
+                return Response({"detail": "slug cannot be blank"}, status=400)
+
+            # unique slug check inside same category (active)
+            if childs.find_one(
+                {
+                    "_id": {"$ne": oid},
+                    "$or": [
+                        {"category_id": cat["_id"]},
+                        {"category_id": str(cat["_id"])},
+                    ],
+                    "slug": new_slug,
+                    "is_deleted": False,
+                },
+{"_id": 1},
+            ):
+                return Response({"detail": "Child slug exists in this category"}, status=400)
+
+            set_doc["slug"] = new_slug
+
+        # soft delete / restore (no created/updated date as you want)
+        if "is_deleted" in d:
+            set_doc["is_deleted"] = bool(d.get("is_deleted"))
+
+        # ✅ OPTIONAL: normalize category_id to ObjectId if it was string before
+        # (để về sau không mismatch nữa)
+        if isinstance(cur.get("category_id"), str):
+            set_doc["category_id"] = cat["_id"]
+
+        if not set_doc:
+            return Response({"detail": "No fields to update"}, status=400)
+
+        childs.update_one({"_id": oid}, {"$set": set_doc})
+
+        out = childs.find_one({"_id": oid})
+        return Response(ser(out), status=200)
+
+
+
+class AdminDeleteCategoryChild(APIView):
+    permission_classes = [AllowAny]  # đổi sang IsAuthenticated/RoleRequired nếu cần
+
+    def delete(self, request, category_slug, child_id):
+        oid = to_oid(child_id)
+        if not oid:
+            return Response({"detail": "Invalid child_id"}, status=400)
+
+        db = get_db()
+        categories = db["categories"]
+        childs = db["category_child"]
+
+        cat = categories.find_one({"slug": category_slug, "is_deleted": False}, {"_id": 1})
+        if not cat:
+            return Response({"detail": "Category not found"}, status=404)
+
+        # ✅ support both ObjectId/string stored category_id
+        cur = childs.find_one(
+            {
+                "_id": oid,
+                "$or": [
+                    {"category_id": cat["_id"]},
+                    {"category_id": str(cat["_id"])},
+                ],
+            },
+            {"_id": 1, "is_deleted": 1},
+        )
+        if not cur:
+            return Response({"detail": "Category child not found"}, status=404)
+
+        childs.update_one({"_id": oid}, {"$set": {"is_deleted": True}})
+        return Response({"detail": "Deleted"}, status=200)
+
+
+
+
+
 
 
 

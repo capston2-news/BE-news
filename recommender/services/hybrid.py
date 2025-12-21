@@ -1,7 +1,7 @@
 # recommender/services/hybrid.py
 from __future__ import annotations
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from bson import ObjectId
 import math
 from datetime import datetime, timezone, timedelta
@@ -69,6 +69,17 @@ def _dt_utc(x) -> Optional[datetime]:
     return dt
 
 
+def _to_oid(x) -> Optional[ObjectId]:
+    if x is None:
+        return None
+    if isinstance(x, ObjectId):
+        return x
+    s = str(x)
+    if ObjectId.is_valid(s):
+        return ObjectId(s)
+    return None
+
+
 # ---------- Popular + recent ----------
 def top_popular_recent(db, limit: int = 200, days: int = 7, today_bonus: float = 2.0) -> List[str]:
     pipeline = [
@@ -121,12 +132,11 @@ def top_popular_recent_by_categories(
         pipeline.append({"$match": {"a.category_name": {"$in": category_names}}})
 
     if category_ids:
-        oids = []
+        oids: List[ObjectId] = []
         for s in category_ids:
-            try:
-                oids.append(ObjectId(s))
-            except Exception:
-                pass
+            oid = _to_oid(s)
+            if oid:
+                oids.append(oid)
         if oids:
             pipeline.append({"$match": {"a.category_id": {"$in": oids}}})
 
@@ -165,100 +175,157 @@ def chroma_by_user_vector(collection, user_vec, n_results: int = 300) -> List[st
     return q.get("ids", [[]])[0]
 
 
-# ---------- Fetch meta ----------
-def fetch_meta_map(db, ids: List[str]) -> Dict[str, Dict[str, Any]]:
+# ---------- Bookmark helpers (schema đúng như ảnh) ----------
+def fetch_bookmark_set(db, user_id: Optional[str], article_ids: List[str]) -> Set[str]:
+    """
+    bookmarks schema:
+      { _id:ObjectId, article_id:ObjectId, user_id:ObjectId, created_at:datetime }
+    Return: set[str] of article_id that user bookmarked.
+    """
+    if not user_id or not article_ids:
+        return set()
+
+    u_oid = _to_oid(user_id)
+    if not u_oid:
+        return set()
+
+    a_oids: List[ObjectId] = []
+    for aid in article_ids:
+        ao = _to_oid(aid)
+        if ao:
+            a_oids.append(ao)
+
+    if not a_oids:
+        return set()
+
+    rows = list(
+        db["bookmarks"].find(
+            {"user_id": u_oid, "article_id": {"$in": a_oids}},
+            {"article_id": 1},
+        )
+    )
+
+    out: Set[str] = set()
+    for r in rows:
+        v = r.get("article_id")
+        if isinstance(v, ObjectId):
+            out.add(str(v))
+        elif v is not None:
+            out.add(str(v))
+    return out
+
+
+# ---------- Fetch meta (map category + child + slug + bookmark + content) ----------
+def fetch_meta_map(db, ids: List[str], user_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     if not ids:
         return {}
 
     oids: List[ObjectId] = []
     for s in ids:
-        try:
-            oids.append(ObjectId(s))
-        except Exception:
-            pass
+        oid = _to_oid(s)
+        if oid:
+            oids.append(oid)
     if not oids:
         return {}
 
-    docs = list(db["articles"].find(
-        {"_id": {"$in": oids}},
-        {
-            "title": 1,
-            "summary": 1,     # ✅ add
-            "keywords": 1,    # ✅ add
-            "entities": 1,    # ✅ add
-            "images":1,
-            "site": 1,
-            "external_url": 1,
-            "published_at": 1,
-            "category_id": 1,
-            "category_child_id": 1,
-            "category_name": 1,
-            "category_child_name": 1,
-        }
-    ))
+    docs = list(
+        db["articles"].find(
+            {"_id": {"$in": oids}},
+            {
+                "title": 1,
+                "content": 1,
+                "summary": 1,
+                "keywords": 1,
+                "entities": 1,
+                "images": 1,
+                "site": 1,
+                "external_url": 1,
+                "published_at": 1,
+                "category_id": 1,
+                "category_child_id": 1,
 
-    # gom ObjectId để map tên
+                # fallback nếu article có sẵn
+                "category_name": 1,
+                "category_child_name": 1,
+                "category_slug": 1,
+                "category_child_slug": 1,
+            },
+        )
+    )
+
+    # gom id để lookup
     cat_oids: List[ObjectId] = []
     child_oids: List[ObjectId] = []
-
     for d in docs:
-        c = d.get("category_id")
-        cc = d.get("category_child_id")
+        co = _to_oid(d.get("category_id"))
+        if co:
+            cat_oids.append(co)
+        cco = _to_oid(d.get("category_child_id"))
+        if cco:
+            child_oids.append(cco)
 
-        if isinstance(c, ObjectId):
-            cat_oids.append(c)
-        else:
-            try:
-                if c and ObjectId.is_valid(str(c)):
-                    cat_oids.append(ObjectId(str(c)))
-            except Exception:
-                pass
-
-        if isinstance(cc, ObjectId):
-            child_oids.append(cc)
-        else:
-            try:
-                if cc and ObjectId.is_valid(str(cc)):
-                    child_oids.append(ObjectId(str(cc)))
-            except Exception:
-                pass
-
-    cat_map: Dict[str, str] = {}
+    cat_map: Dict[str, Dict[str, str]] = {}
     if cat_oids:
-        for c in db["categories"].find({"_id": {"$in": cat_oids}}, {"name": 1, "title": 1}):
-            cat_map[str(c["_id"])] = c.get("name") or c.get("title") or ""
+        uniq = list(set(cat_oids))
+        for c in db["categories"].find({"_id": {"$in": uniq}}, {"name": 1, "title": 1, "slug": 1}):
+            cid = str(c["_id"])
+            cat_map[cid] = {
+                "name": (c.get("name") or c.get("title") or "").strip(),
+                "slug": (c.get("slug") or "").strip(),
+            }
 
-    child_map: Dict[str, str] = {}
+    child_map: Dict[str, Dict[str, str]] = {}
     if child_oids:
-        for c in db["category_child"].find({"_id": {"$in": child_oids}}, {"name": 1, "title": 1}):
-            child_map[str(c["_id"])] = c.get("name") or c.get("title") or ""
+        uniq = list(set(child_oids))
+        for c in db["category_child"].find({"_id": {"$in": uniq}}, {"name": 1, "title": 1, "slug": 1}):
+            cid = str(c["_id"])
+            child_map[cid] = {
+                "name": (c.get("name") or c.get("title") or "").strip(),
+                "slug": (c.get("slug") or "").strip(),
+            }
+
+    bookmarked_set = fetch_bookmark_set(db, user_id, ids) if user_id else set()
 
     out: Dict[str, Dict[str, Any]] = {}
     for d in docs:
         aid = str(d["_id"])
+
         cat_id = d.get("category_id")
         child_id = d.get("category_child_id")
 
         cat_id_str = str(cat_id) if cat_id else ""
         child_id_str = str(child_id) if child_id else ""
 
-        parent_name = (d.get("category_name") or "").strip() or cat_map.get(cat_id_str, "")
-        child_name = (d.get("category_child_name") or "").strip() or child_map.get(child_id_str, "")
+        # parent
+        parent_name = (d.get("category_name") or "").strip() or cat_map.get(cat_id_str, {}).get("name", "")
+        parent_slug = (d.get("category_slug") or "").strip() or cat_map.get(cat_id_str, {}).get("slug", "")
+
+        # child
+        has_child = bool(child_id is not None and child_id_str)
+        child_name = (d.get("category_child_name") or "").strip() or child_map.get(child_id_str, {}).get("name", "")
+        child_slug = (d.get("category_child_slug") or "").strip() or child_map.get(child_id_str, {}).get("slug", "")
 
         out[aid] = {
             "title": d.get("title"),
-            "summary": d.get("summary"),      # ✅ add
-            "keywords": d.get("keywords"),    # ✅ add
+            "content": d.get("content"),
+            "summary": d.get("summary"),
+            "keywords": d.get("keywords"),
             "entities": d.get("entities"),
-            "images" : d.get("images"),
-
+            "images": d.get("images"),
             "source": d.get("site"),
             "url": d.get("external_url"),
             "published_at": d.get("published_at"),
+
             "category_id": cat_id_str,
-            "category_name": parent_name or "",
             "category_child_id": child_id_str,
-            "category_child_name": child_name or None,
+
+            # ✅ flat đúng kiểu bạn muốn
+            "category_name": parent_name or "",
+            "category_slug": parent_slug or "",
+            "category_child_name": (child_name or None) if has_child else None,
+            "category_child_slug": (child_slug or None) if has_child else None,
+
+            "is_bookmarked": (aid in bookmarked_set) if user_id else False,
         }
 
     return out
@@ -304,22 +371,28 @@ def hybrid_recommend(
     if not ids:
         return []
 
-    meta = fetch_meta_map(db, ids)
+    uid = user_profile.get("user_id") or user_profile.get("id")
+    uid_str = str(uid) if uid else None
+
+    meta = fetch_meta_map(db, ids, user_id=uid_str)
 
     if only_categories or only_category_ids:
-        ids = [
-            i for i in ids if (
-                (meta.get(i, {}).get("category_name") in set(only_categories)) or
-                (meta.get(i, {}).get("category_id") in set(only_category_ids))
-            )
-        ] or ids_pop
-        meta = fetch_meta_map(db, ids)
+        only_cat_set = set(only_categories)
+        only_id_set = set(only_category_ids)
+
+        filtered = [
+            i for i in ids
+            if (meta.get(i, {}).get("category_name") in only_cat_set)
+            or (meta.get(i, {}).get("category_id") in only_id_set)
+        ]
+
+        ids = filtered if filtered else ids_pop
+        meta = fetch_meta_map(db, ids, user_id=uid_str)
 
     boosted_scores: Dict[str, float] = dict(fused)
 
     if soft_boost:
-        from .topic_affinity import compute_user_topic_affinity  # tránh vòng import
-        uid = user_profile.get("user_id") or user_profile.get("id")
+        from .topic_affinity import compute_user_topic_affinity
         aff = compute_user_topic_affinity(db, uid) if uid else {}
         max_aff = max(aff.values()) if aff else 0.0
 
@@ -342,20 +415,26 @@ def hybrid_recommend(
             sim[i][j] = 1.0 if (same_cat or same_src) else 0.0
 
     mmr_ids = mmr_rerank(ids, sim, lambda_=0.7, topk=topk, relevance_map=boosted_scores)
-    final_meta = fetch_meta_map(db, mmr_ids)
+    final_meta = fetch_meta_map(db, mmr_ids, user_id=uid_str)
 
     out = []
-    for i in mmr_ids:
+    for aid in mmr_ids:
+        m = final_meta.get(aid, {}) or {}
         out.append({
-            "id": i,
-            "title": final_meta.get(i, {}).get("title"),
-            "images": final_meta.get(i, {}).get("images"),
-            "url": final_meta.get(i, {}).get("url"),
-            "source": final_meta.get(i, {}).get("source"),
-            "category_id": final_meta.get(i, {}).get("category_id"),
-            "category_name": final_meta.get(i, {}).get("category_name"),
-            "category_child_name": final_meta.get(i, {}).get("category_child_name"),
-            "published_at": final_meta.get(i, {}).get("published_at"),
-            "score": boosted_scores.get(i, 0.0),
+            "id": aid,
+            "title": m.get("title"),
+            "content": m.get("content"),
+            "images": m.get("images"),
+            "url": m.get("url"),
+            "source": m.get("source"),
+            "published_at": m.get("published_at"),
+
+            "is_bookmarked": bool(m.get("is_bookmarked")),
+            "category_name": m.get("category_name") or "",
+            "category_slug": m.get("category_slug") or "",
+            "category_child_name": m.get("category_child_name"),
+            "category_child_slug": m.get("category_child_slug"),
+
+            "score": boosted_scores.get(aid, 0.0),
         })
     return out

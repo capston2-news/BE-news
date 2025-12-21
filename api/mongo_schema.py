@@ -177,17 +177,19 @@ def ensure_collections_and_indexes():
 
     # ───────────────────────── comments ─────────────────────────
     comments_validator = {
-        "bsonType":"object",
-        "required":["article_id","username","content","is_deleted"],
-        "properties":{
-            "_id":{"bsonType":"objectId"},
-            "article_id":{"bsonType":"objectId"},  # -> articles._id
-            "username":{"bsonType":"string"},     # -> users._id
-            "content":{"bsonType":"string"},
-            "created_at":{"bsonType":["date","string"]},
-            "is_deleted":{"bsonType":"bool"}
+        "bsonType": "object",
+        "required": ["article_id", "username", "content", "is_deleted", "is_checked"],
+        "properties": {
+            "_id": {"bsonType": "objectId"},
+            "article_id": {"bsonType": "objectId"},  # -> articles._id
+            "username": {"bsonType": "string"},  # -> users._id (bạn đang lưu string)
+            "content": {"bsonType": "string"},
+            "created_at": {"bsonType": ["date", "string"]},
+            "is_deleted": {"bsonType": "bool"},
+            "is_checked": {"bsonType": "bool"},
         }
     }
+
     comments = _create_or_update_collection("comments", comments_validator)
     comments.create_index([("article_id", ASCENDING)], name="ix_comments_article_id")
     comments.create_index([("username", ASCENDING)], name="ix_comments_username")
@@ -217,6 +219,7 @@ def ensure_collections_and_indexes():
         "properties":{
             "_id":{"bsonType":"objectId"},
             "user_id":{"bsonType":"objectId"},
+            "comment_id": {"bsonType": "objectId"},
             "message":{"bsonType":"string"},
             "is_read":{"bsonType":"bool"},
             "created_at":{"bsonType":["date","string"]}

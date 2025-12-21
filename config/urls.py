@@ -24,6 +24,8 @@ urlpatterns = [
     path("api/", include(("api.urls", "api"), namespace="api")),  # <— include app urls
     path("api/recommend/", include("recommender.urls")),
     path("api/chatbot/", include("chatbot.urls")),
+    path("api/", include("notifications.urls")),
+    path("api/weather/", include("weather.urls")),
 ]
 
 if settings.DEBUG:

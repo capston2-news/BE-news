@@ -44,7 +44,9 @@ INSTALLED_APPS = [
     'corsheaders',
     'crawler.apps.CrawlerConfig',
     'recommender.apps.RecommenderConfig',
-    'chatbot.apps.ChatbotConfig'
+    'chatbot.apps.ChatbotConfig',
+    'notifications.apps.NotificationsConfig',
+    'weather.apps.WeatherConfig'
 ]
 
 MIDDLEWARE = [

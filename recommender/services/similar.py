@@ -19,28 +19,25 @@ from .hybrid import (
 from .topic_affinity import compute_user_topic_affinity
 from .user_profile import build_or_get_user_profile
 from .keyword_affinity import compute_user_keyword_affinity, keyword_soft_boost
-from .entity_affinity import compute_user_entity_affinity, entity_soft_boost  # ✅ add
+from .entity_affinity import compute_user_entity_affinity, entity_soft_boost
 
 
 # -------------------------------------------------------------------
-# CONFIG (CHỈNH Ở ĐÂY)
+# CONFIG
 # -------------------------------------------------------------------
 HARD_SCORE_THRESHOLD = 0.0
 POPULARITY_LIMIT = 60
 AFFINITY_DIVERSITY_THRESHOLD = 0.6
 
-# weight cho RRF (quan trọng)
 W_USER_VEC = 0.9
 W_SEED = 2.0
 W_POP_WHEN_PHRASE = 0.05
 W_POP_DEFAULT = 0.25
 
-# phrase boost (quan trọng)
 PHRASE_BONUS = 0.25
 PHRASE_BONUS_EXTRA = 0.05
 PHRASE_BONUS_CAP = 0.40
 
-# ✅ weights boost thêm
 W_TOPIC = 0.25
 W_KEYWORD = 0.45
 W_ENTITY = 0.55
@@ -431,16 +428,16 @@ def similar_by_article(db, chroma_collection, embedder, article_id, user_id=None
     fused = rrf_fuse_weighted([ids_vec, ids_pop], [1.2, 0.20], k=60)
     ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)
     ids = [i for i, _ in ranked[:max(6 * topk, 120)]]
-
     if not ids:
         return []
 
-    meta = fetch_meta_map(db, ids)
+    meta = fetch_meta_map(db, ids, user_id=str(user_id) if user_id else None)
 
     if base_cat:
         same_cat = [aid for aid in ids if (meta.get(aid, {}) or {}).get("category_name") == base_cat]
         if same_cat:
             ids = same_cat
+            meta = fetch_meta_map(db, ids, user_id=str(user_id) if user_id else None)
 
     sim = [[0.0 for _ in ids] for __ in ids]
     for i, a in enumerate(ids):
@@ -452,20 +449,25 @@ def similar_by_article(db, chroma_collection, embedder, article_id, user_id=None
             sim[i][j] = 1.0 if (ma.get("source") and ma.get("source") == mb.get("source")) else 0.0
 
     mmr_ids = mmr_rerank(ids, sim, lambda_=0.75, topk=topk, relevance_map=fused)
-    final_meta = fetch_meta_map(db, mmr_ids)
+    final_meta = fetch_meta_map(db, mmr_ids, user_id=str(user_id) if user_id else None)
 
     return [{
         "id": aid,
         "title": (final_meta.get(aid, {}) or {}).get("title"),
+        "content": (final_meta.get(aid, {}) or {}).get("content"),  # ✅ ADD
         "images": (final_meta.get(aid, {}) or {}).get("images"),
         "url": (final_meta.get(aid, {}) or {}).get("url"),
         "source": (final_meta.get(aid, {}) or {}).get("source"),
-        "category_name": (final_meta.get(aid, {}) or {}).get("category_name"),
-        "category_child_name": (final_meta.get(aid, {}) or {}).get("category_child_name"),
         "published_at": (final_meta.get(aid, {}) or {}).get("published_at"),
+
+        "is_bookmarked": bool((final_meta.get(aid, {}) or {}).get("is_bookmarked")),
+        "category_name": (final_meta.get(aid, {}) or {}).get("category_name") or "",
+        "category_slug": (final_meta.get(aid, {}) or {}).get("category_slug") or "",
+        "category_child_name": (final_meta.get(aid, {}) or {}).get("category_child_name"),
+        "category_child_slug": (final_meta.get(aid, {}) or {}).get("category_child_slug"),
+
         "score": fused.get(aid, 0.0),
     } for aid in mmr_ids]
-
 
 # -------------------------------------------------------------------
 # USER TOPIC FEED (THEO PHRASE + KEYWORD + ENTITY)
@@ -497,14 +499,14 @@ def user_topic_feed(
         ids = [i for i, score in ranked if score >= HARD_SCORE_THRESHOLD] or [i for i, _ in ranked]
         ids = ids[:max(4 * topk, 100)]
 
-        meta = fetch_meta_map(db, ids)
+        meta = fetch_meta_map(db, ids, user_id=str(user_id))
 
         focus_cat_id = get_focus_category_id(db, user_id)
         if focus_cat_id:
             filtered = [aid for aid in ids if meta.get(aid, {}).get("category_id") == focus_cat_id]
             if filtered:
                 ids = filtered
-                meta = fetch_meta_map(db, ids)
+                meta = fetch_meta_map(db, ids, user_id=str(user_id))
 
         ids = _exclude_read(db, ids, user_id)
         ids = _filter_by_recent_days(meta, ids, days=7)
@@ -516,12 +518,18 @@ def user_topic_feed(
         return [{
             "id": aid,
             "title": meta.get(aid, {}).get("title"),
+            "content": meta.get(aid, {}).get("content"),  # ✅ ADD
             "images": (meta.get(aid, {}) or {}).get("images"),
             "url": meta.get(aid, {}).get("url"),
             "source": meta.get(aid, {}).get("source"),
-            "category_name": meta.get(aid, {}).get("category_name"),
-            "category_child_name": meta.get(aid, {}).get("category_child_name"),
             "published_at": meta.get(aid, {}).get("published_at"),
+
+            "is_bookmarked": bool(meta.get(aid, {}).get("is_bookmarked")),
+            "category_name": meta.get(aid, {}).get("category_name") or "",
+            "category_slug": meta.get(aid, {}).get("category_slug") or "",
+            "category_child_name": meta.get(aid, {}).get("category_child_name"),
+            "category_child_slug": meta.get(aid, {}).get("category_child_slug"),
+
             "score": fused.get(aid, 0.0),
         } for aid in ids_sorted]
 
@@ -587,6 +595,7 @@ def user_topic_feed(
         seen.add(p)
         tmp.append(p)
     phrases = tmp[:12]
+
     enable_phrase = bool(phrases)
 
     # ------------------- 5) Weighted fuse -------------------
@@ -609,16 +618,15 @@ def user_topic_feed(
 
     ids = [i for i, score in ranked if score >= HARD_SCORE_THRESHOLD] or [i for i, _ in ranked]
     ids = ids[:max(10 * topk, 220)]
-    meta = fetch_meta_map(db, ids)  # ✅ meta có summary/keywords/entities nhờ sửa hybrid.py
 
-    # ép category cha (nếu có)
+    meta = fetch_meta_map(db, ids, user_id=str(user_id))
+
     if cat_filter:
         filtered_ids = [aid for aid in ids if meta.get(aid, {}).get("category_name") in cat_filter]
         if filtered_ids:
             ids = filtered_ids
-            meta = fetch_meta_map(db, ids)
+            meta = fetch_meta_map(db, ids, user_id=str(user_id))
 
-    # lọc 7 ngày + exclude đã đọc
     ids = _filter_by_recent_days(meta, ids, days=7)
     ids = _exclude_read(db, ids, user_id)
     if not ids:
@@ -686,12 +694,18 @@ def user_topic_feed(
         out.append({
             "id": aid,
             "title": m.get("title"),
+            "content": m.get("content"),  # ✅ ADD
             "images": m.get("images"),
             "url": m.get("url"),
             "source": m.get("source"),
-            "category_name": m.get("category_name"),
-            "category_child_name": m.get("category_child_name"),
             "published_at": m.get("published_at"),
+
+            "is_bookmarked": bool(m.get("is_bookmarked")),
+            "category_name": (m.get("category_name") or ""),
+            "category_slug": (m.get("category_slug") or ""),
+            "category_child_name": m.get("category_child_name"),
+            "category_child_slug": m.get("category_child_slug"),
+
             "score": boosted_scores.get(aid, 0.0),
         })
     return out

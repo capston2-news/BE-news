@@ -7,7 +7,6 @@ from google.genai import types
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
-# Dùng gemini-2.5-flash làm default
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 if not API_KEY:
@@ -20,7 +19,7 @@ BOT_NAME = "Nana – Trợ lý Tin Tức"
 
 def chat_generic(message: str, history=None) -> str:
     """
-    Gọi Gemini cho chatbot, trả về RAW TEXT (JSON string) với schema:
+    Gọi Gemini cho chatbot, trả về RAW TEXT (JSON string) với schema (KHÔNG có topk/min_focus):
 
     {
       "action": "CHAT" | "GET_ARTICLES" | "SUMMARIZE_ARTICLE" | "GET_RECOMMENDATIONS",
@@ -30,9 +29,7 @@ def chat_generic(message: str, history=None) -> str:
         "time_range": "today" | "last_7_days" | null,
         "region": "vietnam" | "world" | null,
         "locations": ["<slug>", ...],
-        "keywords": ["<keyword>", ...],
-        "topk": number | null,
-        "min_focus": number | null
+        "keywords": ["<keyword>", ...]
       }
     }
 
@@ -51,7 +48,7 @@ You are {BOT_NAME}, a friendly multilingual news assistant.
 
 VERY IMPORTANT – OUTPUT FORMAT:
 Always respond in pure JSON (no markdown, no extra text, no explanation)
-with exactly this schema:
+with exactly this schema (DO NOT add extra keys):
 
 {{
   "action": "CHAT" | "GET_ARTICLES" | "SUMMARIZE_ARTICLE" | "GET_RECOMMENDATIONS",
@@ -61,9 +58,7 @@ with exactly this schema:
     "time_range": "today" | "last_7_days" | null,
     "region": "vietnam" | "world" | null,
     "locations": ["<slug>", ...],
-    "keywords": ["<keyword>", ...],
-    "topk": number | null,
-    "min_focus": number | null
+    "keywords": ["<keyword>", ...]
   }}
 }}
 
@@ -86,17 +81,11 @@ Filter semantics:
       "Hà Nội"  -> "ha-noi"
 - keywords:
     main entities/topics in user's request (persons, teams, objects...)
-    all lowercase.
+    all lowercase, keep them short.
     Examples:
       ["messi"]
       ["ronaldo"]
-      ["messi", "ronaldo"]
-- topk:
-    - number of articles the user wants if they mention it (e.g. "5 bài", "3 articles")
-    - otherwise null (backend sẽ dùng default, ví dụ 10).
-- min_focus:
-    - only used for recommendations (how strict to focus on user's interests).
-    - if user không nói gì đặc biệt → nên để null.
+      ["ai", "chip"]
 
 Category slug rules:
 - lowercase
@@ -106,167 +95,132 @@ Category slug rules:
   "Thể thao"  -> "the-thao"
   "Bóng đá"   -> "bong-da"
 
-VERY IMPORTANT – HOW TO USE HISTORY:
+IMPORTANT:
+- Do NOT output "topk" or "min_focus".
+  Backend will decide those values.
 
+VERY IMPORTANT – HOW TO USE HISTORY:
 - You see the full conversation history (user + assistant messages).
 - Use it to understand context (location, time, topic).
 - EVERY TIME you output action = "GET_ARTICLES" or "GET_RECOMMENDATIONS",
-  you must output a FULL FILTER SET for THIS TURN. Do not rely on backend to remember filters for you.
+  you must output a FULL FILTER SET for THIS TURN.
+  Do not rely on backend to remember filters for you.
 
 Examples:
-1) If previous turn: "tin tức ở Đà Nẵng hôm nay"
-   and current turn: "còn bóng đá thì sao?"
+1) Previous turn: "tin tức ở Đà Nẵng hôm nay"
+   Current turn: "còn bóng đá thì sao?"
    You may output:
    {{
      "action": "GET_ARTICLES",
-     "reply": "...",
-     "category_slug": "the-thao" or "bong-da",
+     "reply": "Mình tìm giúp bạn tin bóng đá ở Đà Nẵng hôm nay nhé.",
+     "category_slug": "bong-da",
      "filters": {{
        "time_range": "today",
        "region": "vietnam",
        "locations": ["da-nang"],
-       "keywords": ["bong da"],
-       "topk": null,
-       "min_focus": null
+       "keywords": ["bong da"]
      }}
    }}
 
-2) If previous turn: "báo thời sự"
-   and current turn: "các bài viết về messi"
-   You MUST treat it as a new topic 'messi':
-   - Usually set "category_slug": null (unless user clearly says "thời sự về messi")
-   - Filters example:
+2) Previous turn: "báo thời sự"
+   Current turn: "các bài viết về messi"
+   Treat it as new topic 'messi':
+   {{
+     "action": "GET_ARTICLES",
+     "reply": "Mình tìm các bài liên quan đến Messi cho bạn nhé.",
+     "category_slug": null,
      "filters": {{
        "time_range": null,
        "region": null,
        "locations": [],
-       "keywords": ["messi"],
-       "topk": null,
-       "min_focus": null
+       "keywords": ["messi"]
      }}
+   }}
 
 Rules for actions:
 
 1) GET_ARTICLES:
-   Use when the user asks for news by time/location/topic,
-   BUT does NOT explicitly ask for recommended / highlighted / favourite news.
+Use when the user asks for news by time/location/topic,
+BUT does NOT explicitly ask for recommended / highlighted / favourite news.
 
-   Examples for GET_ARTICLES:
-     - "tin tức hôm nay"
-     - "tin tức thời sự hôm nay"
-     - "tin trong nước hôm nay"
-     - "tin bóng đá hôm nay"
-     - "news today"
-     - "latest news in Vietnam today"
-
-   In these cases:
-     - action = "GET_ARTICLES"
-     - set filters.time_range = "today" / "last_7_days" / "yesterday" if user says so
-     - region / locations / keywords as usual.
-     - filters.topk and filters.min_focus should usually be null.
+Examples for GET_ARTICLES:
+- "tin tức hôm nay"
+- "tin trong nước hôm nay"
+- "tin bóng đá hôm nay"
+- "news today"
+- "latest news in Vietnam today"
 
 2) SUMMARIZE_ARTICLE:
-   If the user asks to summarize the article they are currently reading:
-     - "tóm tắt bài viết đang đọc"
-     - "tóm tắt bài báo này"
-     - "summarize this article"
-   then:
-     - action        = "SUMMARIZE_ARTICLE"
-     - reply         = short confirmation
-     - category_slug = null
-     - filters       = {{
-         "time_range": null,
-         "region": null,
-         "locations": [],
-         "keywords": [],
-         "topk": null,
-         "min_focus": null
-       }}
+If the user asks to summarize the article they are currently reading:
+- "tóm tắt bài viết đang đọc"
+- "tóm tắt bài báo này"
+- "summarize this article"
+
+Output:
+- action = "SUMMARIZE_ARTICLE"
+- reply = short confirmation
+- category_slug = null
+- filters = {{
+    "time_range": null,
+    "region": null,
+    "locations": [],
+    "keywords": []
+  }}
 
 3) GET_RECOMMENDATIONS:
-   Use ONLY when the user explicitly wants recommended / highlighted / favourite news.
+Use ONLY when the user explicitly wants recommended / highlighted / favourite news.
 
-   Vietnamese triggers:
-     - "tin tức nổi bật hôm nay"
-     - "tin thời sự nổi bật hôm nay"
-     - "gợi ý cho mình vài tin tức"
-     - "các bài viết em hay đọc"
-     - "tin tức yêu thích của mình"
-     - "gợi ý thêm vài bài tương tự"
+Vietnamese triggers:
+- "tin tức nổi bật hôm nay"
+- "gợi ý cho mình vài tin tức"
+- "tin mình có thể thích"
+- "gợi ý thêm vài bài tương tự"
 
-   English triggers:
-     - "recommend some news for me"
-     - "highlighted news today"
-     - "news I might like"
-     - "favourite articles"
+English triggers:
+- "recommend some news for me"
+- "highlighted news today"
+- "news I might like"
 
-   Examples for GET_RECOMMENDATIONS:
-     - "gợi ý cho mình vài tin tức nổi bật hôm nay"
-     - "tin tức thời sự nổi bật hôm nay mình nên đọc là gì?"
-     - "recommend some news I might like today"
-
-   In these cases:
-     - action = "GET_RECOMMENDATIONS"
-     - reply  = short confirmation in user's language.
-     - filters.time_range:
-         * "today" if user says "hôm nay" / "today"
-         * "last_7_days" if "tuần này" / "7 ngày qua" / "last few days"
-         * null if no time mentioned.
-     - filters.region / locations / keywords: fill only if user mentions them.
-     - filters.topk:
-         * set to the number of articles if user says "5 bài", "3 articles", etc.
-         * otherwise null.
-     - filters.min_focus:
-         * if user wants "chỉ những bài thật sự liên quan" / "only very relevant",
-           you may set to 0.5–0.7,
-         * otherwise null.
+Output:
+- action = "GET_RECOMMENDATIONS"
+- reply  = short confirmation in user's language
+- category_slug: set only if user clearly names a category; otherwise null
+- filters: fill time_range/region/locations/keywords only if user mentions them; otherwise null/[].
 
 4) CHAT:
-   For all other requests (small talk, explanations, etc.):
-     - action        = "CHAT"
-     - category_slug = null
-     - filters       = {{
-         "time_range": null,
-         "region": null,
-         "locations": [],
-         "keywords": [],
-         "topk": null,
-         "min_focus": null
-       }}
-     - reply         = your normal answer for the user.
+For all other requests (small talk, explanations, etc.):
+- action = "CHAT"
+- category_slug = null
+- filters = {{
+    "time_range": null,
+    "region": null,
+    "locations": [],
+    "keywords": []
+  }}
+- reply = your normal answer.
 
 Output MUST be valid JSON ONLY.
 """
 
-    contents.append(
-        {
-            "role": "user",
-            "parts": [{"text": system_prompt}],
-        }
-    )
+    # system instruction (kept as a message for compatibility with your current usage)
+    contents.append({"role": "user", "parts": [{"text": system_prompt}]})
 
-    # thêm history
+    # history
     if history:
         for turn in history:
             role = turn.get("role")
-            content = turn.get("content", "")
+            content = (turn.get("content") or "").strip()
             if not content:
                 continue
-
             if role == "user":
                 contents.append({"role": "user", "parts": [{"text": content}]})
             elif role in ("model", "assistant"):
                 contents.append({"role": "model", "parts": [{"text": content}]})
 
-    # message hiện tại
-    contents.append(
-        {
-            "role": "user",
-            "parts": [{"text": message}],
-        }
-    )
+    # current message
+    contents.append({"role": "user", "parts": [{"text": message}]})
 
-    # gọi Gemini, ép JSON
+    # call Gemini, force JSON
     response = client.models.generate_content(
         model=MODEL,
         contents=contents,
@@ -304,10 +258,7 @@ def summarize_article(content: str, language: str = "vi") -> str:
     contents = [
         {
             "role": "user",
-            "parts": [
-                {"text": instr},
-                {"text": content},
-            ],
+            "parts": [{"text": instr}, {"text": content}],
         }
     ]
 
@@ -320,19 +271,17 @@ def summarize_article(content: str, language: str = "vi") -> str:
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        # debug nếu cần:
-        # print("DEBUG_SUMMARY_RESPONSE:", response)
     except Exception as e:
         if language == "en":
             return f"Error while summarizing: {e}"
         return f"Lỗi khi tóm tắt bài viết: {e}"
 
-    # 1) Thử lấy trực tiếp response.text
+    # 1) direct response.text
     text = getattr(response, "text", None)
     if isinstance(text, str) and text.strip():
         return text.strip()
 
-    # 2) Fallback: đọc từ candidates[*].content.parts[*].text
+    # 2) fallback candidates[*].content.parts[*].text
     candidates = getattr(response, "candidates", None) or []
     collected = []
 
@@ -350,7 +299,7 @@ def summarize_article(content: str, language: str = "vi") -> str:
     if collected:
         return "\n".join(collected)
 
-    # 3) Fallback cuối
+    # 3) final fallback
     if language == "en":
         return "Sorry, I couldn’t generate a summary for this article right now."
     return (
