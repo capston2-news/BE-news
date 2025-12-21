@@ -1,1 +1,16 @@
+# Python venv
 venv/
+.venv/
+
+# Env
+.env
+
+# Cache
+__pycache__/
+*.pyc
+
+# Chroma / Vector DB (KHÔNG đẩy lên git)
+chroma_store/
+*.sqlite3
+*.sqlite
+*.db
